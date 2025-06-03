@@ -27,7 +27,7 @@ Some organizations operate under fixed vCore contracts or have disabled native a
 ## 📁 File Structure
 
 - `autoscaler.xml`: The core Mule flow
-- `config.properties`: External configuration (credentials, target app IDs)
+- `config.properties.example`: Sample configuration (rename to `config.properties`)
 
 ## 🛠 config.properties Template
 
