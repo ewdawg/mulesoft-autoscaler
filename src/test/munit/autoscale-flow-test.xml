@@ -34,6 +34,14 @@
                     <munit-tools:payload value="#[{ access_token: 'token' }]" />
                 </munit-tools:then-return>
             </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:equal-to expression="#[attributes.method]" expectedValue="GET" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ replicas: 2 }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
 
             <set-payload doc:name="Set Webhook Payload" value="#[{ event: { appName: 'test-app', value: 85 } }]" />
         </munit:behavior>
@@ -68,6 +76,14 @@
                 </munit-tools:with-attributes>
                 <munit-tools:then-return>
                     <munit-tools:payload value="#[{ access_token: 'token' }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:equal-to expression="#[attributes.method]" expectedValue="GET" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ replicas: 2 }]" />
                 </munit-tools:then-return>
             </munit-tools:mock-when>
 
