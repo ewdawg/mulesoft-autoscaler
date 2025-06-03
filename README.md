@@ -1,6 +1,6 @@
 # MuleSoft Auto-Scaler via Webhook Alerts
 
-This is an AI generated lightweight MuleSoft application that enables **auto-scaling behavior for CloudHub deployments** based on performance alerts — all built using MuleSoft itself.
+This is an AI-generated lightweight MuleSoft application that enables **auto-scaling behavior for CloudHub deployments** based on performance alerts — all built using MuleSoft itself.
 
 It listens for **Anypoint Monitoring webhook alerts** (e.g., CPU > 80%) and uses the **Runtime Manager API** to scale your deployed MuleSoft application by increasing the number of replicas or allocated resources.
 
