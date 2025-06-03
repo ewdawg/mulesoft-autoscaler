@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+        http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd">
+
+    <munit:config name="autoscale-flow-test-config" />
+
+    <munit:test name="autoscale-flow-high-cpu" description="Runtime Manager PATCH executes when CPU usage is above threshold">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:equal-to expression="#[attributes.method]" expectedValue="PATCH" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="{}" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:equal-to expression="#[attributes.method]" expectedValue="POST" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ access_token: 'token' }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <set-payload doc:name="Set Webhook Payload" value="#[{ event: { appName: 'test-app', value: 85 } }]" />
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="autoscale-flow" />
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:verify-call processor="http:request" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:equal-to expression="#[attributes.method]" expectedValue="PATCH" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="autoscale-flow-low-cpu" description="PATCH skipped when CPU usage below threshold">
+        <munit:behavior>
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:equal-to expression="#[attributes.method]" expectedValue="PATCH" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="{}" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <munit-tools:mock-when processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:equal-to expression="#[attributes.method]" expectedValue="POST" />
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ access_token: 'token' }]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <set-payload doc:name="Set Webhook Payload" value="#[{ event: { appName: 'test-app', value: 60 } }]" />
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="autoscale-flow" />
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:verify-call processor="http:request" times="0">
+                <munit-tools:with-attributes>
+                    <munit-tools:equal-to expression="#[attributes.method]" expectedValue="PATCH" />
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+</mule>
+
