@@ -37,3 +37,7 @@ client.secret=REPLACE_WITH_CLIENT_SECRET
 org.id=REPLACE_WITH_ORG_ID
 env.id=REPLACE_WITH_ENV_ID
 app.id=REPLACE_WITH_TARGET_APP_ID
+```
+
+Rename this file to `config.properties` and place it alongside `autoscaler.xml`
+before running the Mule application.
