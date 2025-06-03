@@ -39,5 +39,4 @@ env.id=REPLACE_WITH_ENV_ID
 app.id=REPLACE_WITH_TARGET_APP_ID
 ```
 
-Rename this file to `config.properties` and place it alongside `autoscaler.xml`
-before running the Mule application.
+Rename `config.properties.example` to `config.properties` before running.
