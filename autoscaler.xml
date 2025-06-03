@@ -1,1 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+      http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+      http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+      http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd">
+
+    <!-- External configuration file for secure and environment-specific properties -->
+    <configuration-properties file="config.properties" />
+
+    <!-- HTTP Listener config -->
+    <http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config">
+        <http:listener-connection host="0.0.0.0" port="8081" />
+    </http:listener-config>
+
+    <!-- Main flow to receive CPU alert and trigger scaling if needed -->
+    <flow name="autoscale-flow">
+        <http:listener doc:name="Receive Alert" config-ref="HTTP_Listener_config" path="/autoscale" />
+
+        <!-- Parse and transform JSON directly using DataWeave -->
+        <dw:transform-message doc:name="Extract Values">
+            <dw:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  appName: payload.event.appName as String,
+  usage: payload.event.value as Number
+}]]></dw:set-payload>
+        </dw:transform-message>
+
+        <!-- Evaluate if CPU usage exceeds threshold -->
+        <choice doc:name="CPU Usage Decision">
+            <when expression="# [payload.usage > 80]">
+                <!-- Request OAuth token from Anypoint -->
+                <http:request method="POST" doc:name="Get Token" url="https://anypoint.mulesoft.com/accounts/api/v2/oauth2/token">
+                    <http:request-builder>
+                        <http:header headerName="Content-Type" value="application/x-www-form-urlencoded" />
+                    </http:request-builder>
+                    <http:body><![CDATA[grant_type=client_credentials&client_id=#[(p('client.id'))]&client_secret=#[(p('client.secret'))]]]></http:body>
+                </http:request>
+
+                <!-- Extract token from response -->
+                <dw:transform-message doc:name="Extract Access Token">
+                    <dw:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+payload.access_token]]></dw:set-payload>
+                </dw:transform-message>
+
+                <!-- Save token for use in API call -->
+                <set-variable variableName="accessToken" value="# [payload]" doc:name="Store Access Token" />
+
+                <!-- Define new resource allocation -->
+                <set-payload doc:name="Prepare Scale Payload">
+                    <![CDATA[{
+                      "replicas": 3,
+                      "resources": {
+                        "cpu": "1.0",
+                        "memory": "2.0Gi"
+                      }
+                    }]]>
+                </set-payload>
+
+                <!-- Call Runtime Manager API to scale up the application -->
+                <http:request method="PATCH" doc:name="Scale App" url="https://anypoint.mulesoft.com/runtimefabric/api/v2/organizations/#[(p('org.id'))]/environments/#[(p('env.id'))]/applications/#[(p('app.id'))]">
+                    <http:request-builder>
+                        <http:header headerName="Authorization" value="Bearer #[vars.accessToken]" />
+                        <http:header headerName="Content-Type" value="application/json" />
+                    </http:request-builder>
+                </http:request>
+            </when>
+            <otherwise>
+                <!-- Log when CPU is below threshold -->
+                <logger level="INFO" doc:name="Log Skipped">CPU below threshold: #[payload.usage]</logger>
+            </otherwise>
+        </choice>
+    </flow>
+</mule>
 
