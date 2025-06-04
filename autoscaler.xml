@@ -35,7 +35,7 @@ output application/json
 
         <!-- Evaluate if CPU usage exceeds threshold -->
         <choice doc:name="CPU Usage Decision">
-            <when expression="#[payload.usage > 80]">
+            <when expression="#[payload.usage > (p('scale.threshold') as Number)]">
                 <!-- Request OAuth token from Anypoint -->
                 <http:request method="POST" doc:name="Get Token" url="https://anypoint.mulesoft.com/accounts/api/v2/oauth2/token">
                     <http:request-builder>

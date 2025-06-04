@@ -2,7 +2,7 @@
 
 This is an AI-generated lightweight MuleSoft application that enables **auto-scaling behavior for CloudHub deployments** based on performance alerts — all built using MuleSoft itself.
 
-It listens for **Anypoint Monitoring webhook alerts** (e.g., CPU > 80%) and uses the **Runtime Manager API** to scale your deployed MuleSoft application by increasing the number of replicas or allocated resources.
+It listens for **Anypoint Monitoring webhook alerts** (e.g., CPU above a threshold) and uses the **Runtime Manager API** to scale your deployed MuleSoft application by increasing the number of replicas or allocated resources.
 
 ## 🔧 Use Case
 
@@ -12,7 +12,7 @@ Some organizations operate under fixed vCore contracts or have disabled native a
 
 1. Anypoint Monitoring alert sends a webhook with performance data.
 2. This app receives the webhook at `/autoscale`, evaluates CPU usage.
-3. If CPU usage exceeds the threshold, the app:
+3. If CPU usage exceeds the configured threshold, the app:
    - Authenticates with the Anypoint Platform
    - Issues a PATCH call to the Runtime Manager API
    - Increases the number of replicas or vCore allocation for the targeted app
@@ -27,7 +27,7 @@ Some organizations operate under fixed vCore contracts or have disabled native a
 ## 📁 File Structure
 
 - `autoscaler.xml`: The core Mule flow
-- `config.properties`: External configuration (credentials, target app IDs)
+- `config.properties`: External configuration (credentials, target app IDs, CPU threshold)
 
 ## 🛠 config.properties Template
 
@@ -37,6 +37,7 @@ client.secret=REPLACE_WITH_CLIENT_SECRET
 org.id=REPLACE_WITH_ORG_ID
 env.id=REPLACE_WITH_ENV_ID
 app.id=REPLACE_WITH_TARGET_APP_ID
+scale.threshold=80
 ```
 
 Rename `config.properties.example` to `config.properties` before running.
