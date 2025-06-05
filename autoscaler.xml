@@ -42,6 +42,11 @@ output application/json
                         <http:header headerName="Content-Type" value="application/x-www-form-urlencoded" />
                     </http:request-builder>
                     <http:body><![CDATA[grant_type=client_credentials&client_id=#[(p('client.id'))]&client_secret=#[(p('client.secret'))]]]></http:body>
+                    <error-handler>
+                        <on-error-propagate logException="true">
+                            <logger level="ERROR" doc:name="Log Token Error">Failed to obtain token: #[error.description]</logger>
+                        </on-error-propagate>
+                    </error-handler>
                 </http:request>
 
                 <!-- Extract token from response -->
@@ -60,6 +65,11 @@ payload.access_token]]></dw:set-payload>
                     <http:request-builder>
                         <http:header headerName="Authorization" value="Bearer #[vars.accessToken]" />
                     </http:request-builder>
+                    <error-handler>
+                        <on-error-propagate logException="true">
+                            <logger level="ERROR" doc:name="Log Current App Error">Failed to retrieve app info: #[error.description]</logger>
+                        </on-error-propagate>
+                    </error-handler>
                 </http:request>
 
                 <!-- Prepare request payload with one additional replica -->
@@ -83,6 +93,11 @@ var current = payload.replicas default 1
                         <http:header headerName="Authorization" value="Bearer #[vars.accessToken]" />
                         <http:header headerName="Content-Type" value="application/json" />
                     </http:request-builder>
+                    <error-handler>
+                        <on-error-propagate logException="true">
+                            <logger level="ERROR" doc:name="Log Scale Error">Failed to scale application: #[error.description]</logger>
+                        </on-error-propagate>
+                    </error-handler>
                 </http:request>
             </when>
             <otherwise>
