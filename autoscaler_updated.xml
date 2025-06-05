@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/doc"
+      xmlns:spring="http://www.springframework.org/schema/beans"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd
+        http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-current.xsd">
+
+    <!-- Property placeholder for external configuration -->
+    <spring:beans>
+        <spring:bean id="configProperties" class="org.springframework.beans.factory.config.PropertyPlaceholderConfigurer">
+            <spring:property name="location" value="classpath:mule-app.properties"/>
+        </spring:bean>
+    </spring:beans>
+
+    <!-- HTTP listener for incoming alerts -->
+    <http:listener-config name="HTTP_Listener_config" host="0.0.0.0" port="${http.port}" doc:name="HTTP Listener Config"/>
+
+    <!-- HTTP request config for Anypoint Platform API calls -->
+    <http:request-config name="AnypointPlatform_HTTP_Request_config"
+                         host="anypoint.mulesoft.com"
+                         port="443"
+                         protocol="HTTPS"
+                         doc:name="HTTP Request Config - Anypoint Platform"/>
+
+    <!-- Flow to handle alert webhook and trigger scaling -->
+    <flow name="autoscale-webhook-flow">
+        <http:listener config-ref="HTTP_Listener_config" path="/autoscale/webhook" doc:name="Listen for Alert Webhook"/>
+        <logger level="INFO" doc:name="Log Incoming Alert" message="Received alert webhook: #[payload]"/>
+
+        <!-- Parse alert payload -->
+        <dw:transform-message doc:name="Extract Alert Details">
+            <dw:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    alertId: payload.alert.id,
+    applicationName: payload.alert.resource.name,
+    deploymentId: payload.alert.resource.id,
+    environmentId: payload.alert.resource.environment.id,
+    organizationId: payload.alert.organization.id,
+    metric: payload.alert.metric,
+    currentValue: payload.alert.currentValue as Number,
+    threshold: payload.alert.threshold as Number
+}]]></dw:set-payload>
+        </dw:transform-message>
+
+        <set-variable variableName="alertDetails" value="#[payload]" doc:name="Store Alert Details"/>
+        <logger level="INFO" doc:name="Log Extracted Details" message="Extracted alert details: #[vars.alertDetails]"/>
+
+        <!-- Obtain OAuth token for Anypoint Platform -->
+        <http:request config-ref="AnypointPlatform_HTTP_Request_config" path="/accounts/api/v2/oauth2/token" method="POST" doc:name="Get Access Token">
+            <http:body><![CDATA[%dw 2.0
+output application/x-www-form-urlencoded
+---
+{
+    "client_id": p('anypoint.client.id'),
+    "client_secret": p('anypoint.client.secret'),
+    "grant_type": "client_credentials"
+}]]></http:body>
+            <http:response-validator>
+                <http:success-status-code-validator values="200"/>
+            </http:response-validator>
+        </http:request>
+        <set-variable variableName="accessToken" value="#[payload.access_token]" doc:name="Set Access Token"/>
+        <logger level="INFO" doc:name="Log Access Token Status" message="Successfully obtained Anypoint Platform access token."/>
+
+        <!-- Get current deployment info -->
+        <http:request config-ref="AnypointPlatform_HTTP_Request_config"
+                      path="/amc/application-manager/api/v2/organizations/#[vars.alertDetails.organizationId]/environments/#[vars.alertDetails.environmentId]/deployments/#[vars.alertDetails.deploymentId]"
+                      method="GET"
+                      doc:name="Get Current Deployment Details">
+            <http:headers>
+                <http:header key="Authorization" value="Bearer #[vars.accessToken]"/>
+                <http:header key="X-ANYPNT-ORG-ID" value="#[vars.alertDetails.organizationId]"/>
+                <http:header key="X-ANYPNT-ENV-ID" value="#[vars.alertDetails.environmentId]"/>
+            </http:headers>
+            <http:response-validator>
+                <http:success-status-code-validator values="200"/>
+            </http:response-validator>
+        </http:request>
+
+        <set-variable variableName="currentDeployment" value="#[payload]" doc:name="Store Current Deployment"/>
+        <logger level="INFO" doc:name="Log Current Deployment Info"
+                message="Current deployment for #[vars.alertDetails.applicationName]: replicas=#[vars.currentDeployment.target.replicas], vCores=#[vars.currentDeployment.target.vCores]"/>
+
+        <!-- Determine new replica count -->
+        <set-variable variableName="currentReplicas" value="#[vars.currentDeployment.target.replicas as Number]" doc:name="Get Current Replicas"/>
+        <set-variable variableName="maxReplicas" value="5" doc:name="Define Max Replicas (configurable)"/>
+        <set-variable variableName="newReplicas" value="#[min(vars.currentReplicas + 1, vars.maxReplicas)]" doc:name="Calculate New Replicas"/>
+
+        <choice doc:name="Check if Scaling is Needed and Possible">
+            <when expression="#[vars.alertDetails.currentValue >= vars.alertDetails.threshold and vars.newReplicas > vars.currentReplicas]">
+                <logger level="INFO" doc:name="Log Scaling Action"
+                        message="CPU #[vars.alertDetails.currentValue]% >= #[vars.alertDetails.threshold]%. Scaling #[vars.alertDetails.applicationName] from #[vars.currentReplicas] to #[vars.newReplicas] replicas."/>
+
+                <!-- Update application deployment with new replica count -->
+                <http:request config-ref="AnypointPlatform_HTTP_Request_config"
+                              path="/amc/application-manager/api/v2/organizations/#[vars.alertDetails.organizationId]/environments/#[vars.alertDetails.environmentId]/deployments/#[vars.alertDetails.deploymentId]"
+                              method="PUT"
+                              doc:name="Update Application Replicas">
+                    <http:headers>
+                        <http:header key="Authorization" value="Bearer #[vars.accessToken]"/>
+                        <http:header key="X-ANYPNT-ORG-ID" value="#[vars.alertDetails.organizationId]"/>
+                        <http:header key="X-ANYPNT-ENV-ID" value="#[vars.alertDetails.environmentId]"/>
+                        <http:header key="Content-Type" value="application/json"/>
+                    </http:headers>
+                    <http:body><![CDATA[%dw 2.0
+output application/json
+---
+{
+    "target": {
+        "replicas": vars.newReplicas,
+        "vCores": vars.currentDeployment.target.vCores,
+        "region": vars.currentDeployment.target.region
+    },
+    "configuration": vars.currentDeployment.configuration,
+    "asset": vars.currentDeployment.asset,
+    "lastModified": vars.currentDeployment.lastModified,
+    "name": vars.currentDeployment.name
+}]]></http:body>
+                    <http:response-validator>
+                        <http:success-status-code-validator values="200"/>
+                    </http:response-validator>
+                </http:request>
+                <logger level="INFO" doc:name="Log Success" message="Successfully updated replicas for #[vars.alertDetails.applicationName] to #[vars.newReplicas]"/>
+                <set-payload value='{"status":"success", "message":"Scaling action initiated."}' doc:name="Success Response"/>
+            </when>
+            <otherwise>
+                <logger level="INFO" doc:name="Log No Action"
+                        message="No scaling action taken for #[vars.alertDetails.applicationName]. Current replicas: #[vars.currentReplicas], New calculated replicas: #[vars.newReplicas]. CPU: #[vars.alertDetails.currentValue]%. (Either already scaled, or CPU below threshold, or at max replicas)"/>
+                <set-payload value='{"status":"info", "message":"No scaling action needed or possible."}' doc:name="Info Response"/>
+            </otherwise>
+        </choice>
+
+        <error-handler>
+            <on-error-continue enableNotifications="true" logException="true" doc:name="On Error Continue">
+                <logger level="ERROR" doc:name="Log Error" message="Error processing webhook or scaling: #[error.description]"/>
+                <set-payload value='{"status":"error", "message":"Failed to process alert or scale application.", "details":"#[error.description]"}' doc:name="Error Response Payload"/>
+                <set-property propertyName="http.status" value="500" doc:name="Set HTTP Status 500"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+</mule>
