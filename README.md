@@ -2,7 +2,7 @@
 
 This is an AI-generated lightweight MuleSoft application that enables **auto-scaling behavior for CloudHub deployments** based on performance alerts — all built using MuleSoft itself.
 
-It listens for **Anypoint Monitoring webhook alerts** (e.g., CPU above a threshold) and uses the **Runtime Manager API** to scale your deployed MuleSoft application by increasing the number of replicas or allocated resources.
+It listens for **Anypoint Monitoring webhook alerts** (e.g., CPU above a threshold) and uses the **Runtime Fabric API** (for CloudHub 2.0) to scale your deployed MuleSoft application by increasing the number of replicas or allocated resources.
 
 ## 🔧 Use Case
 
@@ -14,12 +14,12 @@ Some organizations operate under fixed vCore contracts or have disabled native a
 2. This app receives the webhook at `/autoscale`, evaluates CPU usage.
 3. If CPU usage exceeds the configured threshold, the app:
    - Authenticates with the Anypoint Platform
-   - Issues a PATCH call to the Runtime Manager API
+   - Issues a PATCH call to the Runtime Fabric API (for CloudHub 2.0)
    - Increases the number of replicas or vCore allocation for the targeted app
 
 ## 🔐 Requirements
 
-- MuleSoft Anypoint Platform credentials with access to Runtime Manager
+- MuleSoft Anypoint Platform credentials with access to Runtime Fabric (Runtime Manager for CloudHub 1.0)
 - API client ID/secret for OAuth
 - Anypoint Monitoring enabled
 - A target app deployed in CloudHub 2.0
