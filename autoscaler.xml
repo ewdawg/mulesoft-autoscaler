@@ -87,7 +87,7 @@ var current = payload.replicas default 1
 }]]></dw:set-payload>
                 </dw:transform-message>
 
-                <!-- Call Runtime Manager API to scale up the application -->
+                <!-- Call Runtime Fabric API (used for CloudHub 2.0) to scale up the application -->
                 <http:request method="PATCH" doc:name="Scale App" url="https://anypoint.mulesoft.com/runtimefabric/api/v2/organizations/#[(p('org.id'))]/environments/#[(p('env.id'))]/applications/#[(p('app.id'))]">
                     <http:request-builder>
                         <http:header headerName="Authorization" value="Bearer #[vars.accessToken]" />
