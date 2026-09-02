@@ -1,5 +1,58 @@
 # Changelog
 
+## 1.1.0 — Decay safety net and durable state
+
+Context: this project emulates CloudHub 2.0 autoscaling, which is gated behind the **Titanium**
+subscription tier. Below that tier the alternatives are permanent over-provisioning or a licence
+upgrade, so the value of this app is entirely in reclaiming replicas that would otherwise be held
+at peak allocation around the clock. That makes a stranded scale-up the failure mode that costs
+real money, and 1.0.0 had no defence against it.
+
+### Added
+
+- **Decay flow** (`autoscale-decay-flow`, `decay-one-deployment`). A scheduled sweep removes one
+  step from any tracked deployment idle beyond `decay.idle.seconds`, repeatedly, until it is back at
+  `scale.min.replicas`. It converges on **elapsed time rather than load**, deliberately: without the
+  top tier there is no metrics API to poll, and time is a signal always available.
+
+  This closes the gap that a purely edge-triggered design leaves open — if a scale-down alert is
+  never configured, is dropped, or the webhook path breaks after a scale-up, replicas previously
+  stayed elevated indefinitely. Decay fails safe: a total failure of the alert path now drifts
+  deployments down to minimum rather than stranding them at maximum.
+
+  Guarded so it cannot fight a live workload: any scaling action resets the idle clock, and an open
+  cooldown suppresses the sweep for that deployment. Per-deployment failures are isolated so one bad
+  entry cannot halt the sweep.
+- `Managed_Deployments` object store recording which deployments this app has scaled, and when it
+  last acted, so decay can act without needing another alert. Entries are removed once a deployment
+  is back at the minimum.
+- Properties: `decay.enabled`, `decay.interval.seconds`, `decay.start.delay.seconds`,
+  `decay.idle.seconds`.
+- Five tests covering decay on idle, decay skipped when recently active, decay suppressed by an open
+  cooldown, tracking removed at the minimum, and registration on scale-up. Suite is now 20 tests.
+
+### Changed
+
+- **Both object stores are now persistent.** `Cooldown_Store` was in-memory, so a restart silently
+  bypassed the debounce. This app has no way to observe load directly and so cannot reconstruct that
+  state after a restart — losing it was a correctness problem, not just an inconvenience.
+
+### Fixed
+
+- **A fresh clone could not run the tests.** `src/main/resources/config.properties` is gitignored,
+  and MUnit needs those values to exist, so `mvn test` failed on any machine without a local copy —
+  including CI. Added a committed `src/test/resources/config.properties` with fake values, which
+  also takes classpath precedence during tests and so makes the suite deterministic regardless of
+  local configuration.
+
+### Documentation
+
+- README now states plainly that this emulates a Titanium-gated feature, explains the tier
+  reasoning, and says when *not* to use it (if you have Titanium, use the native feature).
+- Added the decay rationale, tuning guidance, and the API-shape assumptions to known limitations.
+
+---
+
 ## 1.0.0 — Rebuild as a working Mule 4 application
 
 The project previously consisted of two loose XML files at the repository root with no build

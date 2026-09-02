@@ -220,6 +220,20 @@ max([minR, min([maxR, raw])])
                     <os:value>#[now() as String]</os:value>
                 </os:store>
 
+                <!-- Remember enough about this deployment for the decay flow to
+                     act on it later without needing another alert. -->
+                <os:store doc:name="Track for decay"
+                          key="#[vars.alert.deploymentId]"
+                          objectStore="Managed_Deployments">
+                    <os:value><![CDATA[#[write({
+    applicationName: vars.alert.applicationName,
+    organizationId: vars.alert.organizationId,
+    environmentId: vars.alert.environmentId,
+    replicas: vars.desiredReplicas,
+    lastActionAt: now() as Number {unit: "seconds"}
+}, 'application/json') as String]]]></os:value>
+                </os:store>
+
                 <logger level="INFO" doc:name="Log scaled"
                         message="#['Scaled ' ++ vars.alert.applicationName ++ ' ' ++ vars.direction ++ ' from ' ++ (vars.currentReplicas as String) ++ ' to ' ++ (vars.desiredReplicas as String) ++ ' replicas.']"/>
 
@@ -244,6 +258,126 @@ output application/json
                         message="#['No action for ' ++ vars.alert.applicationName ++ ': already at the replica bound (' ++ (vars.currentReplicas as String) ++ ').']"/>
                 <flow-ref name="build-skipped-response" doc:name="Respond at bound"/>
             </otherwise>
+        </choice>
+    </sub-flow>
+
+    <!--
+      Level-triggered safety net.
+
+      Everything above is edge-triggered: it only acts when an alert arrives. That
+      makes the expensive failure mode a silent one — if a scale-down alert is
+      never configured, is dropped, or the webhook path breaks after a scale-up,
+      the deployment stays at an elevated replica count indefinitely and quietly
+      bills for it.
+
+      This flow converges on elapsed time rather than on load, which matters
+      because without the top-tier subscription there is no metrics API to poll.
+      A deployment that has not been scaled for decay.idle.seconds loses one step,
+      repeatedly, until it is back at scale.min.replicas. Any alert arriving in the
+      meantime resets the clock, so a genuinely busy application is never decayed.
+    -->
+    <flow name="autoscale-decay-flow">
+        <scheduler doc:name="Decay scheduler">
+            <scheduling-strategy>
+                <fixed-frequency frequency="${decay.interval.seconds}"
+                                 startDelay="${decay.start.delay.seconds}"
+                                 timeUnit="SECONDS"/>
+            </scheduling-strategy>
+        </scheduler>
+
+        <choice doc:name="Decay enabled?">
+            <when expression="#[p('decay.enabled') == 'true']">
+                <os:retrieve-all-keys objectStore="Managed_Deployments"
+                                      target="managedKeys"
+                                      doc:name="List managed deployments"/>
+
+                <foreach collection="#[vars.managedKeys]" doc:name="For each managed deployment">
+                    <set-variable variableName="decayKey" value="#[payload]" doc:name="Deployment id"/>
+                    <try doc:name="Isolate per-deployment failures">
+                        <flow-ref name="decay-one-deployment" doc:name="decay-one-deployment"/>
+                        <error-handler>
+                            <on-error-continue type="ANY" logException="true" doc:name="Continue with the rest">
+                                <logger level="ERROR" doc:name="Log decay failure"
+                                        message="#['Decay failed for deployment ' ++ (vars.decayKey default 'unknown') ++ ': ' ++ (error.description default 'unknown error')]"/>
+                            </on-error-continue>
+                        </error-handler>
+                    </try>
+                </foreach>
+            </when>
+        </choice>
+    </flow>
+
+    <sub-flow name="decay-one-deployment">
+        <os:retrieve key="#[vars.decayKey]"
+                     objectStore="Managed_Deployments"
+                     target="managedRecord"
+                     doc:name="Read decay record">
+            <os:default-value>#[null]</os:default-value>
+        </os:retrieve>
+
+        <os:contains key="#[vars.decayKey]"
+                     objectStore="Cooldown_Store"
+                     target="inCooldown"
+                     doc:name="Check cooldown"/>
+
+        <ee:transform doc:name="Evaluate idleness">
+            <ee:variables>
+                <ee:set-variable variableName="record"><![CDATA[%dw 2.0
+output application/java
+---
+if (vars.managedRecord == null) null
+else read(vars.managedRecord, 'application/json')
+]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <ee:transform doc:name="Compute idle seconds">
+            <ee:variables>
+                <ee:set-variable variableName="idleSeconds"><![CDATA[%dw 2.0
+output application/java
+---
+if (vars.record == null) 0
+else (now() as Number {unit: "seconds"}) - (vars.record.lastActionAt as Number)
+]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <choice doc:name="Idle long enough?">
+            <when expression="#[vars.record != null and (not vars.inCooldown) and vars.idleSeconds >= (p('decay.idle.seconds') as Number)]">
+                <ee:transform doc:name="Synthesize decay action">
+                    <ee:variables>
+                        <ee:set-variable variableName="direction">#["DOWN"]</ee:set-variable>
+                        <ee:set-variable variableName="alert"><![CDATA[%dw 2.0
+output application/java
+---
+{
+    alertId: "decay",
+    applicationName: vars.record.applicationName default "unknown",
+    deploymentId: vars.decayKey,
+    organizationId: vars.record.organizationId default "",
+    environmentId: vars.record.environmentId default "",
+    metric: "idle",
+    currentValue: 0
+}
+]]></ee:set-variable>
+                    </ee:variables>
+                </ee:transform>
+
+                <logger level="INFO" doc:name="Log decay"
+                        message="#['Decaying ' ++ (vars.record.applicationName default vars.decayKey) ++ ': idle for ' ++ (vars.idleSeconds as String) ++ 's.']"/>
+
+                <flow-ref name="apply-scaling" doc:name="apply-scaling"/>
+
+                <choice doc:name="Back at minimum?">
+                    <when expression="#[vars.desiredReplicas &lt;= (p('scale.min.replicas') as Number)]">
+                        <os:remove key="#[vars.decayKey]"
+                                   objectStore="Managed_Deployments"
+                                   doc:name="Stop tracking"/>
+                        <logger level="INFO" doc:name="Log tracking stopped"
+                                message="#['Deployment ' ++ vars.decayKey ++ ' is back at the minimum replica count; no longer tracked for decay.']"/>
+                    </when>
+                </choice>
+            </when>
         </choice>
     </sub-flow>
 

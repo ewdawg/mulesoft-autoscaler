@@ -33,3 +33,16 @@ scale.cooldown.seconds=600
 # Used only when the inbound alert does not carry org/env ids of its own.
 anypoint.org.id=
 anypoint.env.id=
+
+# --- Decay (level-triggered safety net) ---
+# Removes one step from any tracked deployment that has gone decay.idle.seconds
+# without a scaling action, until it is back at scale.min.replicas. This is what
+# stops a dropped or unconfigured scale-down alert from stranding replicas.
+decay.enabled=true
+# How often the decay sweep runs.
+decay.interval.seconds=300
+# Delay before the first sweep after startup.
+decay.start.delay.seconds=300
+# Idle time before a deployment loses a step. Keep it well above
+# scale.cooldown.seconds so decay never races a fresh scale-up.
+decay.idle.seconds=1800

@@ -24,14 +24,27 @@
     </http:request-config>
 
     <!-- Debounce store. An entry keyed by deployment id is written after every
-         successful scaling action and expires after scale.cooldown.seconds,
-         which is what stops a repeatedly-firing alert from ratcheting replicas. -->
+         scaling action and expires after scale.cooldown.seconds, which is what
+         stops a repeatedly-firing alert from ratcheting replicas.
+
+         Persistent: this app is edge-triggered and has no way to observe load
+         directly, so it cannot reconstruct this state after a restart. Losing it
+         would let a restart bypass the debounce entirely. -->
     <os:object-store name="Cooldown_Store"
                      doc:name="Cooldown store"
-                     persistent="false"
+                     persistent="true"
                      maxEntries="1000"
                      entryTtl="${scale.cooldown.seconds}"
                      entryTtlUnit="SECONDS"
                      expirationInterval="60"
                      expirationIntervalUnit="SECONDS"/>
+
+    <!-- Deployments this app has scaled, and when it last acted on each. Drives
+         the decay flow. No TTL: an entry lives until the deployment is back at
+         scale.min.replicas, at which point there is nothing left to decay and the
+         entry is removed. -->
+    <os:object-store name="Managed_Deployments"
+                     doc:name="Managed deployments store"
+                     persistent="true"
+                     maxEntries="1000"/>
 </mule>

@@ -1,6 +1,8 @@
-# Local config with secrets -- never commit
-src/main/resources/config.properties
-config.properties
+# Local config holding real secrets -- never commit.
+# Scoped to main/resources deliberately: a bare "config.properties" pattern would
+# also match src/test/resources/config.properties, which MUST be committed or a
+# fresh clone cannot run the test suite.
+/src/main/resources/config.properties
 
 # Build output
 target/

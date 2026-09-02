@@ -23,8 +23,11 @@
       is why keying on the HTTP method (as the previous suite did) cannot work.
     -->
 
-    <munit:before-test name="clear-cooldown-store" description="Empty the cooldown store between tests">
+    <!-- Both stores are persistent, so they survive not just between tests but
+         between builds. Clearing them here is what keeps the suite deterministic. -->
+    <munit:before-test name="clear-stores" description="Empty both object stores between tests">
         <os:clear objectStore="Cooldown_Store" doc:name="Clear cooldown store"/>
+        <os:clear objectStore="Managed_Deployments" doc:name="Clear managed deployments"/>
     </munit:before-test>
 
     <!-- ==================== apply-scaling ==================== -->
@@ -526,6 +529,266 @@
                     <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
                 </munit-tools:with-attributes>
             </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!-- ==================== decay ==================== -->
+
+    <munit:test name="decay-removes-a-replica-when-idle"
+                description="A tracked deployment idle beyond decay.idle.seconds loses one step">
+        <munit:behavior>
+            <munit-tools:mock-when doc:name="Mock token" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Request access token" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ access_token: 'test-token' }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when doc:name="Mock get deployment" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Get deployment" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ target: { replicas: 4 } }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when doc:name="Mock patch" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{}]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <os:store key="dep-idle" objectStore="Managed_Deployments" doc:name="Seed a long-idle record">
+                <os:value><![CDATA[#[write({
+    applicationName: 'idle-app',
+    organizationId: 'org-1',
+    environmentId: 'env-1',
+    replicas: 4,
+    lastActionAt: (now() as Number {unit: "seconds"}) - 99999
+}, 'application/json') as String]]]></os:value>
+            </os:store>
+
+            <set-variable variableName="decayKey" value="dep-idle" doc:name="Deployment id"/>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="decay-one-deployment" doc:name="decay-one-deployment"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that expression="#[vars.desiredReplicas]"
+                                     is="#[MunitTools::equalTo(3)]"
+                                     message="An idle deployment should lose one step"/>
+            <munit-tools:verify-call doc:name="Verify patch called" processor="http:request" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="decay-skips-recently-active-deployment"
+                description="A deployment scaled moments ago is left alone">
+        <munit:behavior>
+            <munit-tools:mock-when doc:name="Mock token" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Request access token" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ access_token: 'test-token' }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when doc:name="Mock patch" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{}]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <os:store key="dep-fresh" objectStore="Managed_Deployments" doc:name="Seed a fresh record">
+                <os:value><![CDATA[#[write({
+    applicationName: 'busy-app',
+    organizationId: 'org-1',
+    environmentId: 'env-1',
+    replicas: 4,
+    lastActionAt: now() as Number {unit: "seconds"}
+}, 'application/json') as String]]]></os:value>
+            </os:store>
+
+            <set-variable variableName="decayKey" value="dep-fresh" doc:name="Deployment id"/>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="decay-one-deployment" doc:name="decay-one-deployment"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:verify-call doc:name="Verify no patch" processor="http:request" times="0">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="decay-respects-an-open-cooldown"
+                description="Decay never races a scaling action that just happened">
+        <munit:behavior>
+            <munit-tools:mock-when doc:name="Mock token" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Request access token" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ access_token: 'test-token' }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when doc:name="Mock patch" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{}]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <os:store key="dep-cooling" objectStore="Managed_Deployments" doc:name="Seed a long-idle record">
+                <os:value><![CDATA[#[write({
+    applicationName: 'cooling-app',
+    organizationId: 'org-1',
+    environmentId: 'env-1',
+    replicas: 4,
+    lastActionAt: (now() as Number {unit: "seconds"}) - 99999
+}, 'application/json') as String]]]></os:value>
+            </os:store>
+            <os:store key="dep-cooling" objectStore="Cooldown_Store" doc:name="Seed an open cooldown">
+                <os:value>#[now() as String]</os:value>
+            </os:store>
+
+            <set-variable variableName="decayKey" value="dep-cooling" doc:name="Deployment id"/>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="decay-one-deployment" doc:name="decay-one-deployment"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:verify-call doc:name="Verify no patch" processor="http:request" times="0">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="decay-stops-tracking-at-minimum"
+                description="Once a deployment is back at the minimum it is dropped from the managed set">
+        <munit:behavior>
+            <munit-tools:mock-when doc:name="Mock token" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Request access token" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ access_token: 'test-token' }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when doc:name="Mock get deployment" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Get deployment" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ target: { replicas: 2 } }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when doc:name="Mock patch" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{}]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <os:store key="dep-last-step" objectStore="Managed_Deployments" doc:name="Seed a long-idle record">
+                <os:value><![CDATA[#[write({
+    applicationName: 'winding-down',
+    organizationId: 'org-1',
+    environmentId: 'env-1',
+    replicas: 2,
+    lastActionAt: (now() as Number {unit: "seconds"}) - 99999
+}, 'application/json') as String]]]></os:value>
+            </os:store>
+
+            <set-variable variableName="decayKey" value="dep-last-step" doc:name="Deployment id"/>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="decay-one-deployment" doc:name="decay-one-deployment"/>
+            <os:contains key="dep-last-step" objectStore="Managed_Deployments" target="stillTracked" doc:name="Still tracked?"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that expression="#[vars.desiredReplicas]"
+                                     is="#[MunitTools::equalTo(1)]"
+                                     message="Should have decayed to the minimum"/>
+            <munit-tools:assert-that expression="#[vars.stillTracked]"
+                                     is="#[MunitTools::equalTo(false)]"
+                                     message="A deployment at the minimum should no longer be tracked"/>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="scaling-up-registers-for-decay"
+                description="A scale-up records the deployment so decay can reclaim it later">
+        <munit:behavior>
+            <munit-tools:mock-when doc:name="Mock token" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Request access token" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ access_token: 'test-token' }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when doc:name="Mock get deployment" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Get deployment" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ target: { replicas: 2 } }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when doc:name="Mock patch" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{}]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <set-variable variableName="direction" value="UP" doc:name="Direction UP"/>
+            <set-variable variableName="alert" doc:name="Alert"
+                          value="#[{ alertId: 'a6', applicationName: 'test-app', deploymentId: 'dep-track', organizationId: 'org-1', environmentId: 'env-1', metric: 'cpu', currentValue: 90 }]"/>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="apply-scaling" doc:name="apply-scaling"/>
+            <os:retrieve key="dep-track" objectStore="Managed_Deployments" target="record" doc:name="Read record">
+                <os:default-value>#[null]</os:default-value>
+            </os:retrieve>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that expression="#[read(vars.record, 'application/json').applicationName]"
+                                     is="#[MunitTools::equalTo('test-app')]"
+                                     message="The scaled deployment should be tracked for decay"/>
+            <munit-tools:assert-that expression="#[read(vars.record, 'application/json').replicas]"
+                                     is="#[MunitTools::equalTo(3)]"
+                                     message="The record should carry the new replica count"/>
         </munit:validation>
     </munit:test>
 
