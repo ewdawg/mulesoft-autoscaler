@@ -1,106 +1,563 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<mule xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
       xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
-      xmlns:http="http://www.mulesoft.org/schema/mule/http"
-      xmlns:dw="http://www.mulesoft.org/schema/mule/ee/dw"
-      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
-      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
       xsi:schemaLocation="
         http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
-        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
         http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
         http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
-        http://www.mulesoft.org/schema/mule/ee/dw http://www.mulesoft.org/schema/mule/ee/dw/current/dw.xsd">
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
 
-    <munit:config name="autoscale-flow-test-config" />
+    <munit:config name="autoscale-flow-test.xml">
+        <munit:parameterizations/>
+    </munit:config>
 
-    <munit:test name="autoscale-flow-high-cpu" description="Runtime Manager PATCH executes when CPU usage is above threshold">
+    <!--
+      The flows under test are driven through their sub-flows rather than the HTTP
+      listener, so each test sets vars.alert directly where the listener would
+      normally have produced it. Mocks are keyed on doc:name: MUnit matches a
+      processor's *configured* attributes, not runtime message attributes, which
+      is why keying on the HTTP method (as the previous suite did) cannot work.
+    -->
+
+    <munit:before-test name="clear-cooldown-store" description="Empty the cooldown store between tests">
+        <os:clear objectStore="Cooldown_Store" doc:name="Clear cooldown store"/>
+    </munit:before-test>
+
+    <!-- ==================== apply-scaling ==================== -->
+
+    <munit:test name="scales-up-by-one-step"
+                description="A deployment below the maximum is patched to one more replica">
         <munit:behavior>
-            <munit-tools:mock-when processor="http:request">
+            <munit-tools:mock-when doc:name="Mock token" processor="http:request">
                 <munit-tools:with-attributes>
-                    <munit-tools:equal-to expression="#[attributes.method]" expectedValue="PATCH" />
+                    <munit-tools:with-attribute whereValue="Request access token" attributeName="doc:name"/>
                 </munit-tools:with-attributes>
                 <munit-tools:then-return>
-                    <munit-tools:payload value="{}" />
+                    <munit-tools:payload value="#[{ access_token: 'test-token' }]"/>
                 </munit-tools:then-return>
             </munit-tools:mock-when>
 
-            <munit-tools:mock-when processor="http:request">
+            <munit-tools:mock-when doc:name="Mock get deployment" processor="http:request">
                 <munit-tools:with-attributes>
-                    <munit-tools:equal-to expression="#[attributes.method]" expectedValue="POST" />
+                    <munit-tools:with-attribute whereValue="Get deployment" attributeName="doc:name"/>
                 </munit-tools:with-attributes>
                 <munit-tools:then-return>
-                    <munit-tools:payload value="#[{ access_token: 'token' }]" />
-                </munit-tools:then-return>
-            </munit-tools:mock-when>
-            <munit-tools:mock-when processor="http:request">
-                <munit-tools:with-attributes>
-                    <munit-tools:equal-to expression="#[attributes.method]" expectedValue="GET" />
-                </munit-tools:with-attributes>
-                <munit-tools:then-return>
-                    <munit-tools:payload value="#[{ replicas: 2 }]" />
+                    <munit-tools:payload value="#[{ target: { replicas: 2 } }]"/>
                 </munit-tools:then-return>
             </munit-tools:mock-when>
 
-            <set-payload doc:name="Set Webhook Payload" value="#[{ event: { appName: 'test-app', value: 85 } }]" />
+            <munit-tools:mock-when doc:name="Mock patch" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{}]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <set-variable variableName="direction" value="UP" doc:name="Direction UP"/>
+            <set-variable variableName="alert" doc:name="Alert"
+                          value="#[{ alertId: 'a1', applicationName: 'test-app', deploymentId: 'dep-1', organizationId: 'org-1', environmentId: 'env-1', metric: 'cpu', currentValue: 85 }]"/>
         </munit:behavior>
 
         <munit:execution>
-            <flow-ref name="autoscale-flow" />
+            <flow-ref name="apply-scaling" doc:name="apply-scaling"/>
         </munit:execution>
 
         <munit:validation>
-            <munit-tools:verify-call processor="http:request" times="1">
+            <munit-tools:assert-that expression="#[vars.currentReplicas]"
+                                     is="#[MunitTools::equalTo(2)]"
+                                     message="Current replicas should be read from target.replicas"/>
+            <munit-tools:assert-that expression="#[vars.desiredReplicas]"
+                                     is="#[MunitTools::equalTo(3)]"
+                                     message="Should scale up by one step"/>
+            <munit-tools:verify-call doc:name="Verify patch called" processor="http:request" times="1">
                 <munit-tools:with-attributes>
-                    <munit-tools:equal-to expression="#[attributes.method]" expectedValue="PATCH" />
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
                 </munit-tools:with-attributes>
             </munit-tools:verify-call>
         </munit:validation>
     </munit:test>
 
-    <munit:test name="autoscale-flow-low-cpu" description="PATCH skipped when CPU usage below threshold">
+    <munit:test name="scales-down-by-one-step"
+                description="A deployment above the minimum is patched to one fewer replica">
         <munit:behavior>
-            <munit-tools:mock-when processor="http:request">
+            <munit-tools:mock-when doc:name="Mock token" processor="http:request">
                 <munit-tools:with-attributes>
-                    <munit-tools:equal-to expression="#[attributes.method]" expectedValue="PATCH" />
+                    <munit-tools:with-attribute whereValue="Request access token" attributeName="doc:name"/>
                 </munit-tools:with-attributes>
                 <munit-tools:then-return>
-                    <munit-tools:payload value="{}" />
+                    <munit-tools:payload value="#[{ access_token: 'test-token' }]"/>
                 </munit-tools:then-return>
             </munit-tools:mock-when>
 
-            <munit-tools:mock-when processor="http:request">
+            <munit-tools:mock-when doc:name="Mock get deployment" processor="http:request">
                 <munit-tools:with-attributes>
-                    <munit-tools:equal-to expression="#[attributes.method]" expectedValue="POST" />
+                    <munit-tools:with-attribute whereValue="Get deployment" attributeName="doc:name"/>
                 </munit-tools:with-attributes>
                 <munit-tools:then-return>
-                    <munit-tools:payload value="#[{ access_token: 'token' }]" />
-                </munit-tools:then-return>
-            </munit-tools:mock-when>
-            <munit-tools:mock-when processor="http:request">
-                <munit-tools:with-attributes>
-                    <munit-tools:equal-to expression="#[attributes.method]" expectedValue="GET" />
-                </munit-tools:with-attributes>
-                <munit-tools:then-return>
-                    <munit-tools:payload value="#[{ replicas: 2 }]" />
+                    <munit-tools:payload value="#[{ target: { replicas: 4 } }]"/>
                 </munit-tools:then-return>
             </munit-tools:mock-when>
 
-            <set-payload doc:name="Set Webhook Payload" value="#[{ event: { appName: 'test-app', value: 60 } }]" />
+            <munit-tools:mock-when doc:name="Mock patch" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{}]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <set-variable variableName="direction" value="DOWN" doc:name="Direction DOWN"/>
+            <set-variable variableName="alert" doc:name="Alert"
+                          value="#[{ alertId: 'a2', applicationName: 'test-app', deploymentId: 'dep-2', organizationId: 'org-1', environmentId: 'env-1', metric: 'cpu', currentValue: 10 }]"/>
         </munit:behavior>
 
         <munit:execution>
-            <flow-ref name="autoscale-flow" />
+            <flow-ref name="apply-scaling" doc:name="apply-scaling"/>
         </munit:execution>
 
         <munit:validation>
-            <munit-tools:verify-call processor="http:request" times="0">
+            <munit-tools:assert-that expression="#[vars.desiredReplicas]"
+                                     is="#[MunitTools::equalTo(3)]"
+                                     message="Should scale down by one step"/>
+            <munit-tools:verify-call doc:name="Verify patch called" processor="http:request" times="1">
                 <munit-tools:with-attributes>
-                    <munit-tools:equal-to expression="#[attributes.method]" expectedValue="PATCH" />
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="clamps-at-max-replicas"
+                description="A deployment already at scale.max.replicas is not patched">
+        <munit:behavior>
+            <munit-tools:mock-when doc:name="Mock token" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Request access token" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ access_token: 'test-token' }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <munit-tools:mock-when doc:name="Mock get deployment" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Get deployment" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ target: { replicas: 5 } }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <munit-tools:mock-when doc:name="Mock patch" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{}]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <set-variable variableName="direction" value="UP" doc:name="Direction UP"/>
+            <set-variable variableName="alert" doc:name="Alert"
+                          value="#[{ alertId: 'a3', applicationName: 'test-app', deploymentId: 'dep-3', organizationId: 'org-1', environmentId: 'env-1', metric: 'cpu', currentValue: 99 }]"/>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="apply-scaling" doc:name="apply-scaling"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that expression="#[vars.desiredReplicas]"
+                                     is="#[MunitTools::equalTo(5)]"
+                                     message="Should be clamped to the configured maximum"/>
+            <munit-tools:verify-call doc:name="Verify patch not called" processor="http:request" times="0">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="clamps-at-min-replicas"
+                description="A deployment already at scale.min.replicas is not patched">
+        <munit:behavior>
+            <munit-tools:mock-when doc:name="Mock token" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Request access token" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ access_token: 'test-token' }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <munit-tools:mock-when doc:name="Mock get deployment" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Get deployment" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ target: { replicas: 1 } }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <munit-tools:mock-when doc:name="Mock patch" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{}]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <set-variable variableName="direction" value="DOWN" doc:name="Direction DOWN"/>
+            <set-variable variableName="alert" doc:name="Alert"
+                          value="#[{ alertId: 'a4', applicationName: 'test-app', deploymentId: 'dep-4', organizationId: 'org-1', environmentId: 'env-1', metric: 'cpu', currentValue: 2 }]"/>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="apply-scaling" doc:name="apply-scaling"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that expression="#[vars.desiredReplicas]"
+                                     is="#[MunitTools::equalTo(1)]"
+                                     message="Should be clamped to the configured minimum"/>
+            <munit-tools:verify-call doc:name="Verify patch not called" processor="http:request" times="0">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="starts-cooldown-after-scaling"
+                description="A successful scaling action writes a cooldown entry for the deployment">
+        <munit:behavior>
+            <munit-tools:mock-when doc:name="Mock token" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Request access token" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ access_token: 'test-token' }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <munit-tools:mock-when doc:name="Mock get deployment" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Get deployment" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ target: { replicas: 2 } }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <munit-tools:mock-when doc:name="Mock patch" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{}]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <set-variable variableName="direction" value="UP" doc:name="Direction UP"/>
+            <set-variable variableName="alert" doc:name="Alert"
+                          value="#[{ alertId: 'a5', applicationName: 'test-app', deploymentId: 'dep-5', organizationId: 'org-1', environmentId: 'env-1', metric: 'cpu', currentValue: 90 }]"/>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="apply-scaling" doc:name="apply-scaling"/>
+            <os:contains key="dep-5" objectStore="Cooldown_Store" target="cooldownWritten" doc:name="Read cooldown"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that expression="#[vars.cooldownWritten]"
+                                     is="#[MunitTools::equalTo(true)]"
+                                     message="Scaling should open a cooldown window for the deployment"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- ==================== normalize-alert ==================== -->
+
+    <munit:test name="normalizes-nested-alert-shape"
+                description="An alert wrapped in payload.alert is mapped onto the internal shape">
+        <munit:behavior>
+            <munit:set-event>
+                <munit:payload value="#[{ alert: { id: 'alert-9', metric: 'cpu', currentValue: 88, resource: { id: 'dep-9', name: 'billing-api', environment: { id: 'env-9' } }, organization: { id: 'org-9' } } }]"/>
+            </munit:set-event>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="normalize-alert" doc:name="normalize-alert"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that expression="#[vars.alert.deploymentId]" is="#[MunitTools::equalTo('dep-9')]" message="deploymentId"/>
+            <munit-tools:assert-that expression="#[vars.alert.applicationName]" is="#[MunitTools::equalTo('billing-api')]" message="applicationName"/>
+            <munit-tools:assert-that expression="#[vars.alert.organizationId]" is="#[MunitTools::equalTo('org-9')]" message="organizationId"/>
+            <munit-tools:assert-that expression="#[vars.alert.environmentId]" is="#[MunitTools::equalTo('env-9')]" message="environmentId"/>
+            <munit-tools:assert-that expression="#[vars.alert.currentValue]" is="#[MunitTools::equalTo(88)]" message="currentValue"/>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="normalizes-flat-event-shape"
+                description="The legacy payload.event shape still maps onto the internal shape">
+        <munit:behavior>
+            <munit:set-event>
+                <munit:payload value="#[{ event: { appName: 'legacy-app', value: 91, deploymentId: 'dep-legacy' } }]"/>
+            </munit:set-event>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="normalize-alert" doc:name="normalize-alert"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that expression="#[vars.alert.applicationName]" is="#[MunitTools::equalTo('legacy-app')]" message="applicationName"/>
+            <munit-tools:assert-that expression="#[vars.alert.currentValue]" is="#[MunitTools::equalTo(91)]" message="currentValue"/>
+            <munit-tools:assert-that expression="#[vars.alert.deploymentId]" is="#[MunitTools::equalTo('dep-legacy')]" message="deploymentId"/>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="rejects-alert-without-deployment-id"
+                description="An alert carrying no deployment id raises AUTOSCALER:BAD_REQUEST"
+                expectedErrorType="AUTOSCALER:BAD_REQUEST">
+        <munit:behavior>
+            <munit:set-event>
+                <munit:payload value="#[{ alert: { id: 'alert-x', currentValue: 95 } }]"/>
+            </munit:set-event>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="normalize-alert" doc:name="normalize-alert"/>
+        </munit:execution>
+    </munit:test>
+
+    <!-- ==================== verify-webhook-secret ==================== -->
+
+    <munit:test name="rejects-missing-webhook-secret"
+                description="A call with no shared-secret header raises AUTOSCALER:UNAUTHORIZED"
+                expectedErrorType="AUTOSCALER:UNAUTHORIZED">
+        <munit:behavior>
+            <munit:set-event>
+                <munit:attributes value="#[{ headers: {} }]"/>
+            </munit:set-event>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="verify-webhook-secret" doc:name="verify-webhook-secret"/>
+        </munit:execution>
+    </munit:test>
+
+    <munit:test name="rejects-wrong-webhook-secret"
+                description="A call with the wrong shared secret raises AUTOSCALER:UNAUTHORIZED"
+                expectedErrorType="AUTOSCALER:UNAUTHORIZED">
+        <munit:behavior>
+            <munit:set-event>
+                <munit:attributes value="#[{ headers: { 'x-autoscaler-secret': 'not-the-secret' } }]"/>
+            </munit:set-event>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="verify-webhook-secret" doc:name="verify-webhook-secret"/>
+        </munit:execution>
+    </munit:test>
+
+    <munit:test name="accepts-correct-webhook-secret"
+                description="A call presenting the configured shared secret passes through">
+        <munit:behavior>
+            <munit:set-event>
+                <munit:attributes value="#[{ headers: { 'x-autoscaler-secret': 'test-secret' } }]"/>
+            </munit:set-event>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="verify-webhook-secret" doc:name="verify-webhook-secret"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that expression="#[true]" is="#[MunitTools::equalTo(true)]" message="Should not have raised"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- ==================== end-to-end through autoscale-webhook-flow ==================== -->
+
+    <munit:test name="e2e-high-cpu-scales-up"
+                description="A well-formed authenticated alert above the threshold scales the deployment">
+        <munit:behavior>
+            <munit-tools:mock-when doc:name="Mock token" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Request access token" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ access_token: 'test-token' }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when doc:name="Mock get deployment" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Get deployment" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ target: { replicas: 2 } }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when doc:name="Mock patch" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{}]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <munit:set-event>
+                <munit:payload value="#[{ alert: { id: 'e2e-1', metric: 'cpu', currentValue: 92, resource: { id: 'dep-e2e-1', name: 'orders-api', environment: { id: 'env-1' } }, organization: { id: 'org-1' } } }]"/>
+                <munit:attributes value="#[{ headers: { 'x-autoscaler-secret': 'test-secret' } }]"/>
+            </munit:set-event>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="autoscale-webhook-flow" doc:name="autoscale-webhook-flow"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that expression="#[payload.status]" is="#[MunitTools::equalTo('scaled')]" message="Should report a scaling action"/>
+            <munit-tools:assert-that expression="#[payload.replicas]" is="#[MunitTools::equalTo(3)]" message="Should have moved to 3 replicas"/>
+            <munit-tools:verify-call doc:name="Verify patch called once" processor="http:request" times="1">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <!--
+      Invoking the flow twice in one test is not a faithful way to simulate a
+      redelivery: the first run replaces the message attributes, so the second
+      would fail the secret check for reasons unrelated to the cooldown. Instead
+      the store is seeded to represent "a scaling action just happened", which is
+      exactly the state a repeat alert would arrive in.
+    -->
+    <munit:test name="e2e-cooldown-suppresses-repeat-alert"
+                description="An alert arriving inside an open cooldown window does not scale again">
+        <munit:behavior>
+            <munit-tools:mock-when doc:name="Mock token" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Request access token" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ access_token: 'test-token' }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when doc:name="Mock get deployment" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Get deployment" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ target: { replicas: 2 } }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when doc:name="Mock patch" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{}]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <os:store key="dep-e2e-2" objectStore="Cooldown_Store" doc:name="Seed an open cooldown">
+                <os:value>#[now() as String]</os:value>
+            </os:store>
+
+            <munit:set-event>
+                <munit:payload value="#[{ alert: { id: 'e2e-2', metric: 'cpu', currentValue: 92, resource: { id: 'dep-e2e-2', name: 'orders-api', environment: { id: 'env-1' } }, organization: { id: 'org-1' } } }]"/>
+                <munit:attributes value="#[{ headers: { 'x-autoscaler-secret': 'test-secret' } }]"/>
+            </munit:set-event>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="autoscale-webhook-flow" doc:name="autoscale-webhook-flow"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that expression="#[payload.status]" is="#[MunitTools::equalTo('skipped')]" message="Alert inside the cooldown window should be suppressed"/>
+            <munit-tools:verify-call doc:name="Verify no patch" processor="http:request" times="0">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="e2e-unauthenticated-call-returns-401"
+                description="An unauthenticated call is rejected with 401 and never reaches the platform API">
+        <munit:behavior>
+            <munit-tools:mock-when doc:name="Mock patch" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{}]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <munit:set-event>
+                <munit:payload value="#[{ alert: { id: 'e2e-3', metric: 'cpu', currentValue: 99, resource: { id: 'dep-e2e-3', name: 'orders-api', environment: { id: 'env-1' } }, organization: { id: 'org-1' } } }]"/>
+                <munit:attributes value="#[{ headers: { 'x-autoscaler-secret': 'wrong' } }]"/>
+            </munit:set-event>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="autoscale-webhook-flow" doc:name="autoscale-webhook-flow"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that expression="#[vars.httpStatus]" is="#[MunitTools::equalTo(401)]" message="Should respond 401"/>
+            <munit-tools:assert-that expression="#[payload.status]" is="#[MunitTools::equalTo('unauthorized')]" message="Should report unauthorized"/>
+            <munit-tools:verify-call doc:name="Verify no patch" processor="http:request" times="0">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Patch replicas" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+            </munit-tools:verify-call>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="e2e-value-within-band-takes-no-action"
+                description="A metric between the two thresholds never calls the platform API">
+        <munit:behavior>
+            <munit-tools:mock-when doc:name="Mock token" processor="http:request">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Request access token" attributeName="doc:name"/>
+                </munit-tools:with-attributes>
+                <munit-tools:then-return>
+                    <munit-tools:payload value="#[{ access_token: 'test-token' }]"/>
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+
+            <munit:set-event>
+                <munit:payload value="#[{ alert: { id: 'e2e-4', metric: 'cpu', currentValue: 55, resource: { id: 'dep-e2e-4', name: 'orders-api', environment: { id: 'env-1' } }, organization: { id: 'org-1' } } }]"/>
+                <munit:attributes value="#[{ headers: { 'x-autoscaler-secret': 'test-secret' } }]"/>
+            </munit:set-event>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="autoscale-webhook-flow" doc:name="autoscale-webhook-flow"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that expression="#[payload.status]" is="#[MunitTools::equalTo('skipped')]" message="Should take no action"/>
+            <munit-tools:verify-call doc:name="Verify no token fetched" processor="http:request" times="0">
+                <munit-tools:with-attributes>
+                    <munit-tools:with-attribute whereValue="Request access token" attributeName="doc:name"/>
                 </munit-tools:with-attributes>
             </munit-tools:verify-call>
         </munit:validation>
     </munit:test>
 </mule>
-

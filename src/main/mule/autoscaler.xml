@@ -1,0 +1,342 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <!--
+      Entry point. Receives an Anypoint Monitoring alert webhook and, subject to
+      the shared secret, the configured thresholds, the replica bounds and the
+      cooldown window, adjusts the target deployment's replica count by one step.
+    -->
+    <flow name="autoscale-webhook-flow">
+        <http:listener config-ref="HTTP_Listener_config"
+                       path="/autoscale/webhook"
+                       allowedMethods="POST"
+                       doc:name="Receive alert webhook">
+            <http:response statusCode="#[vars.httpStatus default 200]">
+                <http:headers>#[{'Content-Type': 'application/json'}]</http:headers>
+            </http:response>
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body>#[payload]</http:body>
+                <http:headers>#[{'Content-Type': 'application/json'}]</http:headers>
+            </http:error-response>
+        </http:listener>
+
+        <flow-ref name="verify-webhook-secret" doc:name="Verify shared secret"/>
+        <flow-ref name="normalize-alert" doc:name="Normalize alert"/>
+
+        <ee:transform doc:name="Decide direction">
+            <ee:variables>
+                <ee:set-variable variableName="direction"><![CDATA[%dw 2.0
+output application/java
+var v = vars.alert.currentValue
+---
+if (v >= (p('scale.up.threshold') as Number)) "UP"
+else if (v <= (p('scale.down.threshold') as Number)) "DOWN"
+else "NONE"
+]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <choice doc:name="Scaling direction">
+            <when expression="#[vars.direction == 'NONE']">
+                <logger level="INFO" doc:name="Log within band"
+                        message="#['No action for ' ++ vars.alert.applicationName ++ ': ' ++ (vars.alert.currentValue as String) ++ ' is between the scale-down and scale-up thresholds.']"/>
+                <flow-ref name="build-skipped-response" doc:name="Respond within band"/>
+            </when>
+            <otherwise>
+                <os:contains doc:name="Check cooldown"
+                             key="#[vars.alert.deploymentId]"
+                             objectStore="Cooldown_Store"
+                             target="inCooldown"/>
+                <choice doc:name="Cooldown active?">
+                    <when expression="#[vars.inCooldown]">
+                        <logger level="INFO" doc:name="Log cooldown"
+                                message="#['Suppressed ' ++ vars.direction ++ ' for ' ++ vars.alert.applicationName ++ ': still inside the cooldown window.']"/>
+                        <flow-ref name="build-skipped-response" doc:name="Respond cooldown"/>
+                    </when>
+                    <otherwise>
+                        <flow-ref name="apply-scaling" doc:name="Apply scaling"/>
+                    </otherwise>
+                </choice>
+            </otherwise>
+        </choice>
+
+        <error-handler>
+            <on-error-continue type="AUTOSCALER:UNAUTHORIZED" logException="false" doc:name="Unauthorized">
+                <logger level="WARN" doc:name="Log rejected call"
+                        message="Rejected webhook call: missing or invalid X-Autoscaler-Secret header."/>
+                <set-variable variableName="httpStatus" value="#[401]" doc:name="Set 401"/>
+                <ee:transform doc:name="Unauthorized body">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ status: "unauthorized", message: "Missing or invalid webhook secret." }
+]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-continue>
+
+            <on-error-continue type="AUTOSCALER:BAD_REQUEST" logException="false" doc:name="Bad request">
+                <logger level="WARN" doc:name="Log malformed alert"
+                        message="#['Rejected webhook call: ' ++ (error.description default 'malformed alert payload')]"/>
+                <set-variable variableName="httpStatus" value="#[400]" doc:name="Set 400"/>
+                <ee:transform doc:name="Bad request body">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "bad_request",
+    message: error.description default "Malformed alert payload."
+}
+]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-continue>
+
+            <on-error-continue type="ANY" logException="true" doc:name="Unexpected failure">
+                <logger level="ERROR" doc:name="Log failure"
+                        message="#['Autoscaling failed: ' ++ (error.description default 'unknown error')]"/>
+                <set-variable variableName="httpStatus" value="#[500]" doc:name="Set 500"/>
+                <ee:transform doc:name="Error body">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "error",
+    message: "Failed to process alert.",
+    detail: error.description default "unknown error"
+}
+]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!--
+      Rejects any call that does not present the shared secret. This is the only
+      thing standing between a publicly reachable endpoint and a stranger being
+      able to change your replica count, so it runs before anything else.
+    -->
+    <sub-flow name="verify-webhook-secret">
+        <choice doc:name="Secret valid?">
+            <when expression="#[(attributes.headers['x-autoscaler-secret'] default '') != p('webhook.secret')]">
+                <raise-error type="AUTOSCALER:UNAUTHORIZED"
+                             description="Missing or invalid X-Autoscaler-Secret header"
+                             doc:name="Reject call"/>
+            </when>
+        </choice>
+    </sub-flow>
+
+    <!--
+      SINGLE POINT OF TRUTH for the inbound webhook contract.
+
+      NOTE: the exact Anypoint Monitoring webhook body has not been verified
+      against a live alert. Each field falls back through the shapes previously
+      assumed by this project so that correcting the contract means editing this
+      one transform and nothing else. Confirm against a captured payload before
+      pointing this at production.
+    -->
+    <sub-flow name="normalize-alert">
+        <ee:transform doc:name="Normalize alert">
+            <ee:variables>
+                <ee:set-variable variableName="alert"><![CDATA[%dw 2.0
+output application/java
+var a = payload.alert default payload.event default payload
+var resource = a.resource default {}
+---
+{
+    alertId:         (a.id default a.alertId default "unknown") as String,
+    applicationName: (resource.name default a.appName default a.applicationName default "unknown") as String,
+    deploymentId:    (resource.id default a.deploymentId default a.appId default "") as String,
+    organizationId:  (a.organization.id default resource.organizationId default p('anypoint.org.id') default "") as String,
+    environmentId:   (resource.environment.id default a.environmentId default p('anypoint.env.id') default "") as String,
+    metric:          (a.metric default "cpu") as String,
+    currentValue:    (a.currentValue default a.value default 0) as Number
+}
+]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <choice doc:name="Deployment id present?">
+            <when expression="#[vars.alert.deploymentId == '']">
+                <raise-error type="AUTOSCALER:BAD_REQUEST"
+                             description="Alert payload did not contain a deployment id"
+                             doc:name="Reject malformed alert"/>
+            </when>
+        </choice>
+
+        <logger level="INFO" doc:name="Log alert"
+                message="#['Alert ' ++ vars.alert.alertId ++ ' for ' ++ vars.alert.applicationName ++ ': ' ++ vars.alert.metric ++ '=' ++ (vars.alert.currentValue as String)]"/>
+    </sub-flow>
+
+    <!--
+      Reads the deployment, computes a bounded target replica count, and applies
+      it only when it actually differs from the current value.
+    -->
+    <sub-flow name="apply-scaling">
+        <flow-ref name="anypoint-get-token" doc:name="Get access token"/>
+        <flow-ref name="anypoint-get-deployment" doc:name="Get current deployment"/>
+
+        <ee:transform doc:name="Compute target replicas">
+            <ee:variables>
+                <ee:set-variable variableName="currentReplicas"><![CDATA[%dw 2.0
+output application/java
+---
+(vars.deployment.target.replicas default p('scale.min.replicas')) as Number
+]]></ee:set-variable>
+                <ee:set-variable variableName="desiredReplicas"><![CDATA[%dw 2.0
+output application/java
+var step    = p('scale.step') as Number
+var minR    = p('scale.min.replicas') as Number
+var maxR    = p('scale.max.replicas') as Number
+var current = (vars.deployment.target.replicas default p('scale.min.replicas')) as Number
+var raw     = if (vars.direction == "UP") current + step else current - step
+---
+max([minR, min([maxR, raw])])
+]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <choice doc:name="Replica count changing?">
+            <when expression="#[vars.desiredReplicas != vars.currentReplicas]">
+                <flow-ref name="anypoint-patch-replicas" doc:name="Patch replica count"/>
+
+                <os:store doc:name="Start cooldown"
+                          key="#[vars.alert.deploymentId]"
+                          objectStore="Cooldown_Store">
+                    <os:value>#[now() as String]</os:value>
+                </os:store>
+
+                <logger level="INFO" doc:name="Log scaled"
+                        message="#['Scaled ' ++ vars.alert.applicationName ++ ' ' ++ vars.direction ++ ' from ' ++ (vars.currentReplicas as String) ++ ' to ' ++ (vars.desiredReplicas as String) ++ ' replicas.']"/>
+
+                <ee:transform doc:name="Success body">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "scaled",
+    application: vars.alert.applicationName,
+    direction: vars.direction,
+    previousReplicas: vars.currentReplicas,
+    replicas: vars.desiredReplicas
+}
+]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+            <otherwise>
+                <logger level="INFO" doc:name="Log at bound"
+                        message="#['No action for ' ++ vars.alert.applicationName ++ ': already at the replica bound (' ++ (vars.currentReplicas as String) ++ ').']"/>
+                <flow-ref name="build-skipped-response" doc:name="Respond at bound"/>
+            </otherwise>
+        </choice>
+    </sub-flow>
+
+    <sub-flow name="anypoint-get-token">
+        <http:request method="POST"
+                      config-ref="Anypoint_Request_config"
+                      path="/accounts/api/v2/oauth2/token"
+                      doc:name="Request access token">
+            <http:body><![CDATA[#[output application/x-www-form-urlencoded
+---
+{
+    grant_type: "client_credentials",
+    client_id: p('anypoint.client.id'),
+    client_secret: p('anypoint.client.secret')
+}
+]]]></http:body>
+        </http:request>
+        <set-variable variableName="accessToken" value="#[payload.access_token]" doc:name="Store access token"/>
+    </sub-flow>
+
+    <sub-flow name="anypoint-get-deployment">
+        <http:request method="GET"
+                      config-ref="Anypoint_Request_config"
+                      path="/amc/application-manager/api/v2/organizations/{orgId}/environments/{envId}/deployments/{deploymentId}"
+                      doc:name="Get deployment">
+            <http:headers><![CDATA[#[output application/java
+---
+{
+    "Authorization": "Bearer " ++ vars.accessToken
+}
+]]]></http:headers>
+            <http:uri-params><![CDATA[#[output application/java
+---
+{
+    orgId: vars.alert.organizationId,
+    envId: vars.alert.environmentId,
+    deploymentId: vars.alert.deploymentId
+}
+]]]></http:uri-params>
+        </http:request>
+        <set-variable variableName="deployment" value="#[payload]" doc:name="Store deployment"/>
+    </sub-flow>
+
+    <!--
+      PATCH with only the field being changed. The previous implementation sent a
+      full deployment body, which risked overwriting cpu/memory and region with
+      whatever happened to be hardcoded or stale.
+    -->
+    <sub-flow name="anypoint-patch-replicas">
+        <http:request method="PATCH"
+                      config-ref="Anypoint_Request_config"
+                      path="/amc/application-manager/api/v2/organizations/{orgId}/environments/{envId}/deployments/{deploymentId}"
+                      doc:name="Patch replicas">
+            <http:body><![CDATA[#[output application/json
+---
+{
+    target: {
+        replicas: vars.desiredReplicas
+    }
+}
+]]]></http:body>
+            <http:headers><![CDATA[#[output application/java
+---
+{
+    "Authorization": "Bearer " ++ vars.accessToken,
+    "Content-Type": "application/json"
+}
+]]]></http:headers>
+            <http:uri-params><![CDATA[#[output application/java
+---
+{
+    orgId: vars.alert.organizationId,
+    envId: vars.alert.environmentId,
+    deploymentId: vars.alert.deploymentId
+}
+]]]></http:uri-params>
+        </http:request>
+    </sub-flow>
+
+    <sub-flow name="build-skipped-response">
+        <ee:transform doc:name="Skipped body">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "skipped",
+    application: vars.alert.applicationName,
+    direction: vars.direction,
+    currentValue: vars.alert.currentValue
+}
+]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </sub-flow>
+</mule>

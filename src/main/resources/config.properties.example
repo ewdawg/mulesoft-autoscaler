@@ -1,0 +1,35 @@
+# Copy to src/main/resources/config.properties before running.
+# config.properties is gitignored -- NEVER commit real secrets.
+#
+# Any value here can be overridden at deploy time by a system property of the
+# same name (e.g. -M-Danypoint.client.secret=... ), which is how the two secret
+# values below should be supplied in a real environment. See README.md.
+
+# --- HTTP listener ---
+http.port=8081
+
+# Shared secret the caller must present in the X-Autoscaler-Secret header.
+webhook.secret=REPLACE_WITH_A_LONG_RANDOM_STRING
+
+# --- Anypoint Platform (Connected App with client_credentials grant) ---
+anypoint.host=anypoint.mulesoft.com
+anypoint.client.id=REPLACE_WITH_CLIENT_ID
+anypoint.client.secret=REPLACE_WITH_CLIENT_SECRET
+
+# --- Scaling policy ---
+# Scale up when the reported metric is at or above this value.
+scale.up.threshold=80
+# Scale down when the reported metric is at or below this value.
+scale.down.threshold=30
+# Hard bounds. The autoscaler will never move outside this range.
+scale.min.replicas=1
+scale.max.replicas=5
+# Number of replicas added/removed per scaling action.
+scale.step=1
+# Minimum seconds between two scaling actions for the same deployment.
+scale.cooldown.seconds=600
+
+# --- Optional fallbacks ---
+# Used only when the inbound alert does not carry org/env ids of its own.
+anypoint.org.id=
+anypoint.env.id=

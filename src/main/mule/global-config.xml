@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <!-- All tunable values live in config.properties. Secrets should be supplied
+         at deploy time as system properties rather than committed to the file. -->
+    <configuration-properties file="config.properties" doc:name="Configuration properties"/>
+
+    <!-- Inbound: receives the monitoring alert webhook. -->
+    <http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config">
+        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
+    </http:listener-config>
+
+    <!-- Outbound: Anypoint Platform control-plane APIs (token + Application Manager). -->
+    <http:request-config name="Anypoint_Request_config" doc:name="Anypoint Platform request config">
+        <http:request-connection protocol="HTTPS" host="${anypoint.host}" port="443"/>
+    </http:request-config>
+
+    <!-- Debounce store. An entry keyed by deployment id is written after every
+         successful scaling action and expires after scale.cooldown.seconds,
+         which is what stops a repeatedly-firing alert from ratcheting replicas. -->
+    <os:object-store name="Cooldown_Store"
+                     doc:name="Cooldown store"
+                     persistent="false"
+                     maxEntries="1000"
+                     entryTtl="${scale.cooldown.seconds}"
+                     entryTtlUnit="SECONDS"
+                     expirationInterval="60"
+                     expirationIntervalUnit="SECONDS"/>
+</mule>

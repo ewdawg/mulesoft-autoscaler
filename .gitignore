@@ -1,7 +1,12 @@
-# Ignore config files with secrets
+# Local config with secrets -- never commit
+src/main/resources/config.properties
 config.properties
+
+# Build output
+target/
+
+# IDE / OS
 *.iml
 .idea/
-target/
+.mule/
 .DS_Store
-

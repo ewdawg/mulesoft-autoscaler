@@ -1,0 +1,7 @@
+{
+  "minMuleVersion": "4.11.0",
+  "secureProperties": [
+    "anypoint.client.secret",
+    "webhook.secret"
+  ]
+}
