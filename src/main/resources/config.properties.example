@@ -46,3 +46,13 @@ decay.start.delay.seconds=300
 # Idle time before a deployment loses a step. Keep it well above
 # scale.cooldown.seconds so decay never races a fresh scale-up.
 decay.idle.seconds=1800
+
+# --- Diagnostic capture ---
+# When true, the capture endpoint records raw requests to the Alert_Captures
+# object store and the raw body of every inbound alert is captured too.
+# Off by default: leave it off in production.
+capture.enabled=false
+# Path of the capture endpoint. It checks NO shared secret, because the alert
+# source may not be able to send a header -- the random segment in this path is
+# what protects it. Put a long random value on the end before enabling capture.
+capture.path=/autoscale/capture

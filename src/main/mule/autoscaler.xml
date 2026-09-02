@@ -150,6 +150,18 @@ output application/json
       pointing this at production.
     -->
     <sub-flow name="normalize-alert">
+        <!-- Capture the body before interpreting it. If the real alert does carry
+             the shared secret and so reaches this path, this is where its shape
+             gets recorded; the dedicated capture endpoint below covers the case
+             where it cannot send the header at all. Reading the payload here is
+             safe because Mule's repeatable streaming lets the transform below
+             read it again. -->
+        <choice doc:name="Capture raw alert?">
+            <when expression="#[p('capture.enabled') == 'true']">
+                <flow-ref name="capture-request" doc:name="Capture raw alert"/>
+            </when>
+        </choice>
+
         <ee:transform doc:name="Normalize alert">
             <ee:variables>
                 <ee:set-variable variableName="alert"><![CDATA[%dw 2.0
@@ -473,4 +485,224 @@ output application/json
             </ee:message>
         </ee:transform>
     </sub-flow>
+
+    <!-- ==================== Diagnostic capture ====================
+
+      The webhook contract is the one part of this application that could not be
+      verified by testing what it sends, because it is defined by what something
+      else sends it. These flows exist to observe that, and are inert unless
+      capture.enabled is true.
+
+      Why a separate endpoint rather than just logging in normalize-alert:
+      verify-webhook-secret runs first, so if the alert source cannot attach a
+      custom header, a real alert is rejected with 401 and its body is never
+      seen, which is exactly the payload we need. This endpoint checks no
+      header. What protects it instead is capture.path, which carries a random
+      segment: an alert action always lets you set the URL, but may not let you
+      set headers, so the path is the only secret that can be relied on here.
+    -->
+
+    <!--
+      Records one raw request. Deliberately total: it captures the body without
+      interpreting it, so a form-encoded, XML or malformed body is preserved
+      rather than lost to a parse error. The headers matter as much as the body,
+      since they answer whether a custom header survives the trip.
+    -->
+    <sub-flow name="capture-request">
+        <!-- octet-stream so nothing tries to parse the body on the way in. -->
+        <set-variable variableName="rawBody"
+                      value="#[payload]"
+                      mimeType="application/octet-stream"
+                      doc:name="Raw body"/>
+
+        <ee:transform doc:name="Build capture record">
+            <ee:variables>
+                <ee:set-variable variableName="captureRecord"><![CDATA[%dw 2.0
+output application/java
+---
+{
+    receivedAt:  now() as String,
+    method:      attributes.method default "unknown",
+    requestPath: attributes.requestPath default "unknown",
+    queryString: attributes.queryString default "",
+    headers:     attributes.headers default {},
+    body:        (vars.rawBody as String) default ""
+}
+]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <os:store doc:name="Store capture"
+                  key="#[now() as String {format: 'yyyyMMdd-HHmmss.SSS'}]"
+                  objectStore="Alert_Captures">
+            <os:value>#[write(vars.captureRecord, 'application/json') as String]</os:value>
+        </os:store>
+
+        <!-- Marker string so the record can be found by grepping downloaded logs,
+             which is the fallback when the read-back endpoint is unreachable. -->
+        <logger level="INFO" doc:name="Log capture"
+                message="#['AUTOSCALER-CAPTURE ' ++ (write(vars.captureRecord, 'application/json') as String)]"/>
+    </sub-flow>
+
+    <!--
+      Unauthenticated by design (see above). Always answers 200, including when
+      capture itself fails: an alert action that receives errors may be disabled
+      upstream, and losing the alert source would defeat the purpose.
+    -->
+    <flow name="autoscale-capture-flow">
+        <http:listener config-ref="HTTP_Listener_config"
+                       path="${capture.path}"
+                       doc:name="Receive raw capture">
+            <http:response statusCode="#[vars.httpStatus default 200]">
+                <http:headers>#[{'Content-Type': 'application/json'}]</http:headers>
+            </http:response>
+            <http:error-response statusCode="200">
+                <http:body><![CDATA[#[%dw 2.0
+output application/json
+---
+{ status: "captured" }]]]></http:body>
+                <http:headers>#[{'Content-Type': 'application/json'}]</http:headers>
+            </http:error-response>
+        </http:listener>
+
+        <choice doc:name="Capture enabled?">
+            <when expression="#[p('capture.enabled') == 'true']">
+                <flow-ref name="capture-request" doc:name="Capture request"/>
+                <ee:transform doc:name="Captured body">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ status: "captured" }
+]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+            <otherwise>
+                <set-variable variableName="httpStatus" value="#[404]" doc:name="Set 404"/>
+                <ee:transform doc:name="Disabled body">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ status: "disabled" }
+]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </otherwise>
+        </choice>
+
+        <error-handler>
+            <!-- Never fail closed: report success to the caller even if the
+                 capture could not be written, and leave the reason in the log. -->
+            <on-error-continue type="ANY" logException="true" doc:name="Capture failure is not the caller's problem">
+                <logger level="ERROR" doc:name="Log capture failure"
+                        message="#['Failed to capture request: ' ++ (error.description default 'unknown error')]"/>
+                <set-variable variableName="httpStatus" value="#[200]" doc:name="Set 200"/>
+                <ee:transform doc:name="Captured body despite failure">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ status: "captured" }
+]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <!--
+      Reads back what was captured. This is the primary retrieval path; scraping
+      downloaded logs for the AUTOSCALER-CAPTURE marker is the fallback. Requires
+      the shared secret, unlike the capture endpoint itself, because here we are
+      handing data out rather than taking it in.
+    -->
+    <flow name="autoscale-captures-read-flow">
+        <http:listener config-ref="HTTP_Listener_config"
+                       path="/autoscale/captures"
+                       allowedMethods="GET"
+                       doc:name="Read captures">
+            <http:response statusCode="#[vars.httpStatus default 200]">
+                <http:headers>#[{'Content-Type': 'application/json'}]</http:headers>
+            </http:response>
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body>#[payload]</http:body>
+                <http:headers>#[{'Content-Type': 'application/json'}]</http:headers>
+            </http:error-response>
+        </http:listener>
+
+        <flow-ref name="verify-webhook-secret" doc:name="Verify shared secret"/>
+
+        <choice doc:name="Capture enabled?">
+            <when expression="#[p('capture.enabled') == 'true']">
+                <os:retrieve-all-keys objectStore="Alert_Captures"
+                                      target="captureKeys"
+                                      doc:name="List captures"/>
+
+                <set-variable variableName="captures" value="#[[]]" doc:name="Init capture list"/>
+
+                <foreach collection="#[vars.captureKeys default []]" doc:name="For each capture">
+                    <os:retrieve key="#[payload]"
+                                 objectStore="Alert_Captures"
+                                 target="oneCapture"
+                                 doc:name="Read one capture">
+                        <os:default-value>#[null]</os:default-value>
+                    </os:retrieve>
+                    <ee:transform doc:name="Append capture">
+                        <ee:variables>
+                            <ee:set-variable variableName="captures"><![CDATA[%dw 2.0
+output application/java
+---
+if (vars.oneCapture == null) vars.captures
+else (vars.captures << read(vars.oneCapture, 'application/json'))
+]]></ee:set-variable>
+                        </ee:variables>
+                    </ee:transform>
+                </foreach>
+
+                <ee:transform doc:name="Captures body">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    count: sizeOf(vars.captures default []),
+    captures: vars.captures default []
+}
+]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+            <otherwise>
+                <set-variable variableName="httpStatus" value="#[404]" doc:name="Set 404"/>
+                <ee:transform doc:name="Disabled body">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ status: "disabled" }
+]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </otherwise>
+        </choice>
+
+        <error-handler>
+            <on-error-continue type="AUTOSCALER:UNAUTHORIZED" logException="false" doc:name="Unauthorized">
+                <logger level="WARN" doc:name="Log rejected read"
+                        message="Rejected captures read: missing or invalid X-Autoscaler-Secret header."/>
+                <set-variable variableName="httpStatus" value="#[401]" doc:name="Set 401"/>
+                <ee:transform doc:name="Unauthorized body">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ status: "unauthorized", message: "Missing or invalid webhook secret." }
+]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-continue>
+        </error-handler>
+    </flow>
 </mule>

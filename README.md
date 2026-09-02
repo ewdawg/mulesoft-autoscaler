@@ -1,7 +1,7 @@
 # MuleSoft Auto-Scaler
 
-A Mule 4 application that scales a **CloudHub 2.0** deployment up and down in response to Anypoint
-Monitoring alerts.
+A Mule 4 application that scales a **CloudHub 2.0** deployment up and down in response to load
+signals reported over HTTP.
 
 ## Why this exists
 
@@ -10,9 +10,14 @@ Everyone below that tier has the same problem — load varies, replicas do not �
 sanctioned answers: pay for the upgrade, or provision permanently for peak and leave the headroom
 idle around the clock.
 
-This app is the third answer. It uses a capability you already have at lower tiers — monitoring
-alerts with webhook actions — to synthesize the capability you do not. **It is an emulation of the
-Titanium autoscaling feature**, built out of the parts available underneath it.
+This app is the third answer: **an emulation of the Titanium autoscaling feature**, built out of the
+parts available underneath it — the Application Manager API, which any tier can call, plus a signal
+your own application reports about itself.
+
+> **Read [Where alerts come from](#where-alerts-come-from) before adopting this.** Earlier versions
+> of this README claimed the trigger was an Anypoint Monitoring alert with a webhook action. **No
+> such capability exists, at any tier.** Every Anypoint alerting system delivers by email only. The
+> caller has to be something you control; `examples/autoscaler-emitter.xml` is a working one.
 
 The premise is that an application should track its own load as a matter of course, and that
 holding replicas at peak allocation twenty-four hours a day to serve a few hours of traffic is a
@@ -20,10 +25,12 @@ poor default. On a fixed vCore contract the saving is headroom: replicas you are
 vCores other applications can use.
 
 **Scope note.** This does what native autoscaling does, not more. If you are on Titanium, use the
-native feature — it is faster, supported, and does not consume vCores of its own to run. The one
-place this app goes further is scaling on signals native autoscaling cannot see: queue depth,
-orders per minute, or any other business metric you can raise an alert on. `normalize-alert` is
-metric-agnostic, so that path is already open.
+native feature — it is faster, supported, and does not consume vCores of its own to run.
+
+Where it goes further is the signal it scales on. Because the caller is yours (see
+[Where alerts come from](#where-alerts-come-from)), you can scale on queue depth, orders per minute,
+in-flight requests, or anything else you can measure — signals native autoscaling cannot see.
+`normalize-alert` never interprets the metric, only its value.
 
 ## How it works
 
@@ -32,7 +39,7 @@ Two control paths, deliberately different in kind.
 **Edge-triggered — reacts to alerts:**
 
 ```
-Anypoint Monitoring alert
+your alert source  (see examples/autoscaler-emitter.xml)
         │
         ▼
 POST /autoscale/webhook          ← shared-secret header required
@@ -105,8 +112,34 @@ X-Autoscaler-Secret: <value of webhook.secret>
 Content-Type: application/json
 ```
 
-The body is an Anypoint Monitoring alert. `normalize-alert` maps it onto an internal shape,
-tolerating several field layouts (see [Known limitations](#known-limitations)):
+**This contract belongs to this project.** It is not a vendor format being matched — nothing MuleSoft
+ships can call a webhook (see [Where alerts come from](#where-alerts-come-from)), so the caller is
+always something you control and the shape below is simply what this app accepts.
+
+The canonical body:
+
+```json
+{
+  "alert": {
+    "id": "emitter-20260902T0431",
+    "metric": "requests-per-minute",
+    "currentValue": 240,
+    "resource": {
+      "id": "1f63a0a8-b904-4954-8f8a-fdb544d19820",
+      "name": "orders-api",
+      "environment": { "id": "0cb6f230-c36b-4be6-82f9-15db9c466ee1" }
+    },
+    "organization": { "id": "b448e279-ea6b-4e79-9c52-ab9269073cb4" }
+  }
+}
+```
+
+Only two fields are load-bearing: **`resource.id`**, which must be the CloudHub 2.0 *deployment id*
+of the app to scale, and **`currentValue`**, the number compared against the thresholds. Everything
+else is labelling or has a fallback.
+
+`normalize-alert` accepts several alternative spellings, kept because they cost nothing and make the
+endpoint forgiving of hand-written callers:
 
 | Internal field | Read from, in order |
 |---|---|
@@ -118,7 +151,8 @@ tolerating several field layouts (see [Known limitations](#known-limitations)):
 | `metric` | `alert.metric` (default `"cpu"`) |
 | `currentValue` | `alert.currentValue`, `alert.value` |
 
-A body may also be nested under `event` instead of `alert`; both are accepted.
+A body may also be nested under `event` instead of `alert`; both are accepted. `metric` is a label
+only — the app never interprets it, which is what lets you scale on any signal you can measure.
 
 ### Responses
 
@@ -142,14 +176,26 @@ Example success body:
 }
 ```
 
+### Diagnostic endpoints
+
+Both are inert unless `capture.enabled` is `true`, in which case they answer as below. When it is
+`false` they return `404` with `{"status":"disabled"}`. See
+[Verifying your alert source](#3-verifying-your-alert-source).
+
+| Endpoint | Auth | Behaviour |
+|---|---|---|
+| `POST ${capture.path}` | **none** — protected only by the random path segment | Records the raw request. Always `200` `{"status":"captured"}`, even if the capture fails, so an alert action is never disabled by an error response. |
+| `GET /autoscale/captures` | `X-Autoscaler-Secret` | Returns `{"count":n,"captures":[…]}`, each entry carrying `receivedAt`, `method`, `requestPath`, `queryString`, `headers` and the raw `body`. |
+
 ## Requirements
 
 - JDK 17 and Maven 3.9+
 - An Anypoint Platform **Connected App** (`client_credentials`) able to read and modify deployments
   in the target environment
 - A target application on **CloudHub 2.0**
-- Anypoint Monitoring alerts with webhook actions — **the one capability everything here depends
-  on.** Confirm it is available at your tier before building on this.
+- **Something to call the webhook.** Anypoint itself cannot — see
+  [Where alerts come from](#where-alerts-come-from). `examples/autoscaler-emitter.xml` is a
+  ready-made caller you drop into the application you want scaled.
 
 ## Configuration
 
@@ -175,6 +221,8 @@ cp src/main/resources/config.properties.example src/main/resources/config.proper
 | `decay.start.delay.seconds` | Delay before the first sweep after startup |
 | `decay.idle.seconds` | Idle time before a deployment loses a step |
 | `anypoint.org.id` / `anypoint.env.id` | Fallbacks used only if the alert omits them |
+| `capture.enabled` | Whether the diagnostic capture path records raw requests. Off by default |
+| `capture.path` | Path of the unauthenticated capture endpoint. Give it a long random segment |
 
 Supply the two secrets at deploy time rather than in the file — any property can be overridden by a
 system property of the same name:
@@ -194,6 +242,58 @@ system property of the same name:
 - Decay is a backstop, not the primary scale-down path. If it is doing most of the work, your
   scale-down alert is probably misconfigured.
 
+## Where alerts come from
+
+Not from Anypoint. This is the most important thing to know about running this app, and earlier
+versions of this README had it wrong.
+
+**Anypoint has three alerting systems, and all of them deliver by email only — at every subscription
+tier, including Titanium. None can call a webhook.**
+
+| System | What it does when it fires |
+|---|---|
+| Anypoint Monitoring, custom dashboard alerts *(Titanium)* | *"trigger email notifications"* |
+| Runtime Manager alerts | Email. On CloudHub 2.0, only on deployment success/failure — not on metrics |
+| API Manager alerts | *"select Business Group users to receive email notifications"* |
+
+The evidence, in case you are about to go looking yourself:
+
+- MuleSoft's [monitoring docs](https://docs.mulesoft.com/monitoring/alerts) say alerts deliver
+  notifications as emails, and the [CloudHub 2.0 alert docs](https://docs.mulesoft.com/cloudhub-2/ch2-config-app-alerts)
+  document email recipients only.
+- In the docs *source*, non-email destinations appear exactly once — commented out, under a literal
+  `//TODO: VERIFY THAT ALL THESE FEATURES ARE ACTUALLY IMPLEMENTED`:
+
+  ```
+  * Channel Integrations: Ability to specify a channel (such as
+    PagerDuty, SMS, or Slack) to which notifications are sent.
+  ```
+
+  MuleSoft's own writers could not confirm it shipped, so they hid it.
+- On a non-Titanium org the Monitoring **Alerts** page redirects away to the dashboards view; per the
+  docs source that page is Titanium-gated, and lower tiers get links out to API/Runtime alerts.
+- Confirmed directly in the product UI: email is the only delivery channel offered.
+
+### What this means
+
+The premise "Titanium gates autoscaling, so emulate it with alert webhooks available lower down" does
+not hold, because alert webhooks are not available lower down *or higher up*. Buying Titanium would
+get you native autoscaling; it would never have made this design's input path work.
+
+That sounds worse than it is. This app was never really coupled to Anypoint Monitoring — it needs
+*something* to POST a value at it, and that something is now explicitly yours. Two consequences, both
+good:
+
+- **The inbound contract is this project's own**, so it is defined rather than guessed at. Earlier
+  releases carried an open risk that the assumed payload shape was wrong; that risk is gone, because
+  there is no vendor shape to be wrong about.
+- **You can scale on anything you can measure.** Queue depth, orders per minute, in-flight requests
+  — signals native CloudHub autoscaling cannot see. The README used to list this as a bonus. It is
+  now the main event.
+
+`examples/autoscaler-emitter.xml` is a working caller. [Setting up Anypoint](#2-the-alert-source)
+covers wiring it in.
+
 ## Setting up Anypoint
 
 ### 1. Connected App
@@ -204,26 +304,92 @@ In **Access Management → Connected Apps**, create an app with the *App acts on
 - **Read Applications** — for the `GET`
 - **Manage Applications** — for the `PATCH`
 
-### 2. Monitoring alerts
+### 2. The alert source
 
-Create a CPU alert on the target application with a **webhook** action pointing at:
+There is nothing to configure in Anypoint here, because **Anypoint cannot call a webhook.** See
+[Where alerts come from](#where-alerts-come-from) for the evidence. Instead, the application you want
+scaled reports on itself.
+
+Copy `examples/autoscaler-emitter.xml` into the **monitored** application's `src/main/mule/`, add one
+line to each flow whose traffic should count:
+
+```xml
+<flow-ref name="autoscaler-count-request"/>
+```
+
+then configure it and redeploy that application:
 
 ```
-https://<this-app>.<region>.cloudhub.io/autoscale/webhook
+autoscaler.host                  <this-app>.<region>.cloudhub.io
+autoscaler.secret                <same value as this app's webhook.secret>
+autoscaler.emit.interval.seconds 60
+autoscaler.up.threshold          240
+autoscaler.down.threshold        30
+autoscaler.deployment.id         <the monitored app's CloudHub 2.0 deployment id>
+autoscaler.application.name      orders-api
+autoscaler.organization.id       <org id>
+autoscaler.environment.id        <env id>
 ```
 
-Add a custom header `X-Autoscaler-Secret` matching `webhook.secret`. Without it every call is
-rejected with `401`.
+The emitter measures **requests per minute** and reports only when that is outside the band. Its full
+rationale — including why it does not measure CPU or heap, and how to substitute your own signal —
+is in the file's header comment.
 
-Create a **second alert** on the low threshold for scale-down. The decay flow will reclaim replicas
-even if you skip this, but far more slowly than a real signal would.
+A deployed CloudHub 2.0 app cannot discover its own deployment id, so `autoscaler.deployment.id` has
+to be supplied. Find it with:
 
-### 3. Capturing the real payload
+```bash
+anypoint-cli-v4 runtime-mgr application list \
+  --organization "$ORG_ID" --environment 'Sandbox' --output json
+```
 
-The exact webhook body Anypoint Monitoring sends has **not** been verified against a live alert.
-Before production, point one alert at a request-capture endpoint (or temporarily log the raw
-payload in `normalize-alert`) and confirm the mappings above. All mapping lives in that one
-sub-flow.
+The emitter is a reference, not a requirement. Anything that can POST JSON works — a CI job, an
+external uptime monitor, a load test, or your own code. The contract is in
+[Endpoint contract](#endpoint-contract).
+
+### 3. Verifying your alert source
+
+When you point a new caller at this app and it does not behave, the first question is always *what
+did it actually send?* The capture path answers that without log scraping — it records raw requests
+verbatim, including every header, and hands them back over HTTP.
+
+It was built to capture a real Anypoint Monitoring alert. That turned out to be impossible for the
+reasons above, but the tool is if anything more useful now: the callers are yours, so they are the
+ones that need debugging.
+
+Deploy with capture on and a random path segment:
+
+```
+--property "capture.enabled:true"
+--property "capture.path:/autoscale/capture/8f3aa1c9d24b"
+```
+
+Point your caller at `https://<this-app>.<region>.cloudhub.io/autoscale/capture/8f3aa1c9d24b`
+instead of `/autoscale/webhook`, run it, then read back what arrived:
+
+```bash
+curl -s https://<this-app>.<region>.cloudhub.io/autoscale/captures \
+  -H "X-Autoscaler-Secret: $WEBHOOK_SECRET"
+```
+
+Each record carries the raw body, the method, the path, and **every header**. Headers matter as much
+as the body: the usual cause of a caller getting `401` is that its secret header never arrived.
+Capture also records bodies that are not JSON at all, so a caller sending form-encoded data shows up
+as itself rather than as a parse error.
+
+When you are done, point the caller back at `/autoscale/webhook` and set `capture.enabled=false`.
+
+**Why the capture endpoint checks no shared secret.** `verify-webhook-secret` runs before
+`normalize-alert`, so a caller with a missing or wrong header is rejected with `401` and its body —
+the thing you are trying to inspect — is never seen. An endpoint that only captures correctly
+authenticated requests would be useless for debugging authentication. What protects it instead is
+`capture.path`: a caller's URL is always configurable even when its headers are not. Put a long
+random segment on it, and leave `capture.enabled=false` outside of an investigation.
+
+If the read-back endpoint is unreachable, the same record is written to the log with the marker
+`AUTOSCALER-CAPTURE`, so `anypoint-cli-v4 runtime-mgr application download-logs` and a `grep` is the
+fallback. Note that log retrieval through Anypoint **Monitoring** is itself subscription-gated (see
+[Reading logs](#reading-logs)).
 
 ## Verified against a live environment
 
@@ -257,9 +423,26 @@ That last row is the important one. It confirms the scheduler runs, and that
 `os:retrieve-all-keys` works against **Object Store v2** on CloudHub 2.0 — the assumption the whole
 decay design rests on, and the one that could not be checked without deploying.
 
-What remains untested is the **inbound webhook body**: the alerts above were synthetic, hand-built
-to match the assumed shape. Everything the app sends to Anypoint is verified; what Anypoint sends
-the app is not. See [Known limitations](#known-limitations).
+**The capture path**, exercised over HTTP against the same deployment:
+
+| Behaviour | Result |
+|---|---|
+| JSON body to `capture.path` | **200** `captured` |
+| Form-encoded (non-JSON) body | **200**, body stored **verbatim** — capture cannot fail closed |
+| Guessable path without the random segment | **404** — the path token is what protects it |
+| `GET /autoscale/captures` without the secret | **401**, and nothing recorded |
+| `GET /autoscale/captures` with the secret | **200**, raw bodies and all headers returned |
+| Custom header through CloudHub's ingress | **Survives unmodified** |
+| Capture hook on the authenticated webhook path | Records the alert; a rejected `401` records nothing |
+
+Two things worth keeping from that. CloudHub's EDGE ingress passes custom headers through untouched,
+so if a caller can set a header it will arrive. And an unauthorized request is never stored, so the
+capture store cannot be filled by an unauthenticated caller hitting `/autoscale/webhook`.
+
+The **inbound contract** is no longer an open question, but not because it was measured — because it
+turned out there was nothing to measure. No Anypoint alerting system can call a webhook, so no vendor
+payload was ever going to arrive. The contract is now this project's own and is documented in
+[Endpoint contract](#endpoint-contract). See [Where alerts come from](#where-alerts-come-from).
 
 ## Build and test
 
@@ -345,8 +528,36 @@ The deploy target argument is the target **`id`** (e.g. `cloudhub-us-west-2`).
 
 ### Replica count
 
-Both object stores are persistent, so on CloudHub 2.0 they use Object Store v2 and survive restarts.
-Run this app as a **single replica** — see [Known limitations](#known-limitations).
+All three object stores are persistent, so on CloudHub 2.0 they use Object Store v2 and survive
+restarts. Run this app as a **single replica** — see [Known limitations](#known-limitations).
+
+### Reading logs
+
+Worth knowing before you go looking, because it bites in exactly the tier this project targets:
+**log retrieval through Anypoint Monitoring is subscription-gated.** On an org without it, tools that
+route through the Monitoring log-search API — including the MuleSoft MCP server's log retrieval —
+fail with:
+
+```
+Required monitoringCenter subscription one of "Premium, Trial Titanium Monitoring" (1),
+"Premium, Paid Titanium Monitoring" (2), and "Premium, Advanced Monitoring" (4) not found.
+Current value: 3
+```
+
+The CloudHub 2.0 deployment log API is **not** gated, and the CLI reaches it:
+
+```bash
+anypoint-cli-v4 runtime-mgr application describe "$APP_ID" \
+  --organization "$ORG_ID" --environment 'Sandbox' --output json   # take desiredVersion as SPEC_ID
+
+anypoint-cli-v4 runtime-mgr application download-logs "$APP_ID" "$SPEC_ID" ./logs \
+  --organization "$ORG_ID" --environment 'Sandbox'
+```
+
+Prefer `download-logs` over `logs`. The `logs` subcommand tails, and after its first batch it crashes
+on an upstream bug in `anypoint-cli-ch1-plugin`
+(`TypeError: Cannot read properties of undefined (reading 'timestamp')`). The first batch still
+prints, so it is usable in a pinch, but it is not something to script against.
 
 ## Project layout
 
@@ -358,7 +569,11 @@ src/main/mule/autoscaler.xml             flows and sub-flows
 src/main/resources/config.properties.example
 src/test/resources/config.properties     committed test values (fake)
 src/test/munit/autoscale-flow-test.xml   MUnit suite
+examples/autoscaler-emitter.xml          reference alert source, for the MONITORED app
 ```
+
+`examples/` is documentation. It is not compiled, packaged or tested by this project, because it
+belongs to a different application.
 
 ## Flow reference
 
@@ -374,18 +589,22 @@ src/test/munit/autoscale-flow-test.xml   MUnit suite
 | `anypoint-get-deployment` | `GET` the deployment into `vars.deployment`. |
 | `anypoint-patch-replicas` | `PATCH` carrying only `target.replicas`. |
 | `build-skipped-response` | The `skipped` response body shared by all no-action paths. |
+| `capture-request` | Records one raw request — body, method, path, all headers — without interpreting it. |
+| `autoscale-capture-flow` | Unauthenticated capture endpoint on `capture.path`. Always answers `200`. |
+| `autoscale-captures-read-flow` | `GET /autoscale/captures`. Authenticated read-back of captured requests. |
 
 Custom error types: `AUTOSCALER:UNAUTHORIZED` (→ 401), `AUTOSCALER:BAD_REQUEST` (→ 400).
 
-Object stores: `Cooldown_Store` (TTL'd debounce) and `Managed_Deployments` (decay tracking, no TTL —
-entries live until the deployment is back at minimum).
+Object stores: `Cooldown_Store` (TTL'd debounce), `Managed_Deployments` (decay tracking, no TTL —
+entries live until the deployment is back at minimum), and `Alert_Captures` (diagnostic, capped at 25
+entries with a 7-day TTL because it holds unvalidated bodies from an unauthenticated endpoint).
 
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
-| Every call returns `401` | The alert is not sending `X-Autoscaler-Secret`, or it does not match the running config. |
-| Every call returns `400` | The real webhook body matches no layout `normalize-alert` expects. Capture the payload and correct the mapping. |
+| Every call returns `401` | The caller is not sending `X-Autoscaler-Secret`, or it does not match the running config. Turn on capture and inspect the headers it actually sent. |
+| Every call returns `400` | The body carried no deployment id at any accepted path. Capture the payload and compare it against [Endpoint contract](#endpoint-contract). |
 | `500` with `HTTP:UNAUTHORIZED` | Connected App credentials wrong, or missing Read/Manage Applications on that environment. |
 | `500` with `HTTP:NOT_FOUND` | The `deploymentId` is not a CloudHub 2.0 deployment id in the resolved org/environment. |
 | `skipped` when you expect scaling | Within the band, cooldown open, or already at a bound. The log line says which. |
@@ -395,9 +614,22 @@ entries live until the deployment is back at minimum).
 
 ## Known limitations
 
-- **The inbound webhook contract is unverified.** The exact body Anypoint Monitoring posts has not
-  been confirmed against a live alert. `normalize-alert` tolerates the shapes this project has
-  previously assumed and is the single place to correct.
+- **Anypoint cannot drive this app.** No Anypoint alerting system can call a webhook at any tier, so
+  you must supply the caller yourself. See [Where alerts come from](#where-alerts-come-from) and the
+  reference emitter in `examples/`. This is the single biggest thing to understand before adopting
+  it.
+- **The emitter requires editing the monitored application.** A `flow-ref` has to be added to each
+  flow whose traffic should count, and the app's deployment id supplied as a property, because a
+  CloudHub 2.0 app cannot discover its own. If you cannot modify the monitored app, you need a
+  different caller — an external monitor or scheduled job.
+- **The emitter's counter is not atomic.** Read-modify-write on a shared store undercounts under
+  concurrency. Adequate for a scaling signal, unsuitable for anything that must be exact.
+- **`examples/autoscaler-emitter.xml` is not built or tested by this project.** It is a
+  documentation artifact for a different application. Its DataWeave was verified by execution on
+  Mule 4.11.6 and 4.12.2, but nothing guards it against drift.
+- **The capture endpoint is unauthenticated when enabled.** That is deliberate and explained above,
+  but it means `capture.enabled=true` opens a public write path guarded only by the randomness of
+  `capture.path`. Turn it off when the investigation is done.
 - **Only deployments this app has scaled are tracked for decay.** A deployment already sitting at an
   elevated count when this app is first deployed will not be reclaimed until an alert scales it once.
 - **Run a single replica.** Two replicas of *this* app would sweep concurrently and could double-step

@@ -25,9 +25,10 @@
 
     <!-- Both stores are persistent, so they survive not just between tests but
          between builds. Clearing them here is what keeps the suite deterministic. -->
-    <munit:before-test name="clear-stores" description="Empty both object stores between tests">
+    <munit:before-test name="clear-stores" description="Empty all three object stores between tests">
         <os:clear objectStore="Cooldown_Store" doc:name="Clear cooldown store"/>
         <os:clear objectStore="Managed_Deployments" doc:name="Clear managed deployments"/>
+        <os:clear objectStore="Alert_Captures" doc:name="Clear alert captures"/>
     </munit:before-test>
 
     <!-- ==================== apply-scaling ==================== -->
@@ -823,4 +824,111 @@
             </munit-tools:verify-call>
         </munit:validation>
     </munit:test>
+
+    <!-- ==================== diagnostic capture ====================
+
+      These cover the property that matters for the capture path: it must record
+      whatever it is sent without interpreting it, because the whole reason it
+      exists is that we do not know what will be sent. A capture path that only
+      works on bodies we already anticipated would be useless.
+    -->
+
+    <munit:test name="captures-a-raw-request-verbatim"
+                description="capture-request stores the body and headers of an inbound request without interpreting them">
+        <munit:behavior>
+            <munit:set-event>
+                <munit:payload value="#['{&quot;alert&quot;:{&quot;id&quot;:&quot;real-1&quot;}}']"/>
+                <munit:attributes value="#[{ method: 'POST', requestPath: '/autoscale/capture/tok', queryString: '', headers: { 'x-anypoint-signature': 'abc123', 'content-type': 'application/json' } }]"/>
+            </munit:set-event>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="capture-request" doc:name="capture-request"/>
+        </munit:execution>
+
+        <munit:validation>
+            <os:retrieve-all-keys objectStore="Alert_Captures" target="capturedKeys" doc:name="List captures"/>
+            <munit-tools:assert-that expression="#[sizeOf(vars.capturedKeys)]"
+                                     is="#[MunitTools::equalTo(1)]"
+                                     message="Exactly one capture should have been stored"/>
+
+            <os:retrieve key="#[vars.capturedKeys[0]]" objectStore="Alert_Captures" target="storedCapture" doc:name="Read capture"/>
+
+            <munit-tools:assert-that expression="#[read(vars.storedCapture, 'application/json').body]"
+                                     is="#[MunitTools::containsString('real-1')]"
+                                     message="The raw body should be preserved"/>
+            <munit-tools:assert-that expression="#[read(vars.storedCapture, 'application/json').headers['x-anypoint-signature']]"
+                                     is="#[MunitTools::equalTo('abc123')]"
+                                     message="Headers should be preserved: they answer whether a custom header survives"/>
+            <munit-tools:assert-that expression="#[read(vars.storedCapture, 'application/json').method]"
+                                     is="#[MunitTools::equalTo('POST')]"
+                                     message="The method should be recorded"/>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="captures-a-body-that-is-not-json"
+                description="A form-encoded body is captured intact rather than lost to a parse error">
+        <munit:behavior>
+            <munit:set-event>
+                <munit:payload value="#['metric=cpu&amp;value=93&amp;app=orders']"/>
+                <munit:attributes value="#[{ method: 'POST', requestPath: '/autoscale/capture/tok', queryString: '', headers: { 'content-type': 'application/x-www-form-urlencoded' } }]"/>
+            </munit:set-event>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="capture-request" doc:name="capture-request"/>
+        </munit:execution>
+
+        <munit:validation>
+            <os:retrieve-all-keys objectStore="Alert_Captures" target="capturedKeys" doc:name="List captures"/>
+            <os:retrieve key="#[vars.capturedKeys[0]]" objectStore="Alert_Captures" target="storedCapture" doc:name="Read capture"/>
+            <munit-tools:assert-that expression="#[read(vars.storedCapture, 'application/json').body]"
+                                     is="#[MunitTools::containsString('metric=cpu')]"
+                                     message="A non-JSON body should survive capture unchanged"/>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="capture-disabled-records-nothing"
+                description="With capture.enabled false, the alert path writes no capture record">
+        <munit:behavior>
+            <munit:set-event>
+                <munit:payload value="#[{ alert: { id: 'a-1', metric: 'cpu', currentValue: 91, resource: { id: 'dep-1', name: 'orders-api', environment: { id: 'env-1' } }, organization: { id: 'org-1' } } }]"/>
+            </munit:set-event>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="normalize-alert" doc:name="normalize-alert"/>
+        </munit:execution>
+
+        <munit:validation>
+            <os:retrieve-all-keys objectStore="Alert_Captures" target="capturedKeys" doc:name="List captures"/>
+            <munit-tools:assert-that expression="#[sizeOf(vars.capturedKeys)]"
+                                     is="#[MunitTools::equalTo(0)]"
+                                     message="Capture is off by default and must stay off unless enabled"/>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="captures-read-requires-the-secret"
+                description="The read-back endpoint hands data out, so it is authenticated even though the capture endpoint is not">
+        <munit:behavior>
+            <munit:set-event>
+                <munit:payload value="#[null]"/>
+                <munit:attributes value="#[{ headers: {} }]"/>
+            </munit:set-event>
+        </munit:behavior>
+
+        <munit:execution>
+            <flow-ref name="autoscale-captures-read-flow" doc:name="autoscale-captures-read-flow"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that expression="#[vars.httpStatus]"
+                                     is="#[MunitTools::equalTo(401)]"
+                                     message="Should respond 401"/>
+            <munit-tools:assert-that expression="#[payload.status]"
+                                     is="#[MunitTools::equalTo('unauthorized')]"
+                                     message="Should report unauthorized"/>
+        </munit:validation>
+    </munit:test>
+
 </mule>

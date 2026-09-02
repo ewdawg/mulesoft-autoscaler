@@ -1,5 +1,117 @@
 # Changelog
 
+## 1.3.0 — The alert source does not exist, and the contract is now ours
+
+This release resolves the question that has been open since 1.0.0 — the inbound webhook contract —
+but not by measuring it. By discovering there was nothing to measure.
+
+### The finding
+
+**No Anypoint alerting system can call a webhook, at any subscription tier, including Titanium.**
+All three deliver by email only:
+
+| System | On trigger |
+|---|---|
+| Anypoint Monitoring, custom dashboard alerts *(Titanium)* | "trigger email notifications" |
+| Runtime Manager alerts | Email; on CloudHub 2.0, deployment success/failure only, not metrics |
+| API Manager alerts | "select Business Group users to receive email notifications" |
+
+Established from four independent directions: MuleSoft's rendered docs; the docs *source*, where
+non-email channels appear only inside a commented-out block headed
+`//TODO: VERIFY THAT ALL THESE FEATURES ARE ACTUALLY IMPLEMENTED`; the behaviour of a non-Titanium
+org, where the Monitoring Alerts page redirects away to dashboards; and direct observation in the
+product UI.
+
+This invalidates the premise carried since 1.0.0. The README described Monitoring alerts with
+webhook actions as "the one capability everything here depends on" and told readers to confirm it
+was available at their tier. It is available at no tier. Buying Titanium would deliver native
+autoscaling; it would never have made this design's input path work.
+
+The org's entitlements also confirm the project's underlying rationale is sound — `autoscaling:
+false` — so the problem this app solves is real even though the trigger it assumed was not.
+
+### Why this closes the gap rather than opening a worse one
+
+The app was never coupled to Anypoint Monitoring; it needs *something* to POST a value at it. With
+the caller now explicitly yours, **the inbound contract is this project's own** — defined rather
+than reverse-engineered. The risk carried through three releases, that the assumed payload shape
+was wrong, is gone: there is no vendor shape to be wrong about.
+
+It also promotes what the README treated as a footnote. Scaling on queue depth, orders per minute,
+or in-flight requests — signals native autoscaling cannot see — is now the main event rather than a
+bonus.
+
+### Added
+
+- **`examples/autoscaler-emitter.xml`** — a reference alert source: a drop-in flow for the
+  *monitored* application that counts its own requests and reports rate to the autoscaler. Needs no
+  Titanium and no change to the autoscaler.
+
+  It measures request rate rather than CPU or heap because a Mule app cannot portably observe its
+  own machine metrics, and both obvious routes were tried and rejected on evidence:
+  `java.lang.Runtime` through DataWeave's `java!` interop returns null, since DataWeave's dot
+  notation does JavaBean getter access rather than method invocation; and
+  `ManagementFactory::getMemoryMXBean().heapMemoryUsage` resolves the getter but then fails on the
+  Java 17 module system, because `java.management` does not export `sun.management` and DataWeave
+  reflects on the implementation class. Request rate needs no reflection and survives runtime
+  upgrades. Its DataWeave was verified by execution on 4.11.6 and 4.12.2.
+
+  The flow swallows all errors: a monitoring sidecar that can take down the application it monitors
+  is worse than no monitoring.
+
+- **Diagnostic capture path**, off by default (`capture.enabled=false`):
+  - `capture-request` records one raw request — body, method, path, and **every header** — without
+    interpreting it, so a form-encoded, XML or malformed body survives instead of being lost to a
+    parse error.
+  - `autoscale-capture-flow`, an endpoint on `capture.path` that **checks no shared secret**, since
+    an endpoint that only captures correctly authenticated requests cannot help you debug
+    authentication. It is protected by a random segment in `capture.path`, and always answers `200`,
+    including when capture itself fails.
+  - `autoscale-captures-read-flow` (`GET /autoscale/captures`), authenticated, because it hands data
+    out rather than taking it in.
+  - A capture hook in `normalize-alert`, after the secret check.
+- `Alert_Captures` object store: persistent, capped at 25 entries with a 7-day TTL, because it holds
+  unvalidated request bodies from an endpoint that is deliberately unauthenticated.
+- Properties `capture.enabled` and `capture.path`.
+- Four tests, taking the suite to 24, including verbatim capture of a non-JSON body.
+
+### Verified on the live CloudHub 2.0 deployment
+
+| Behaviour | Result |
+|---|---|
+| JSON body to `capture.path` | 200 `captured` |
+| Form-encoded body | 200, stored verbatim |
+| Guessable path without the random segment | 404 |
+| `GET /autoscale/captures` without secret | 401, nothing recorded |
+| `GET /autoscale/captures` with secret | 200, raw bodies and all headers |
+| Custom header through CloudHub ingress | Survives unmodified |
+| Scaling path, rotated secret | 1 → 2 replicas |
+| Decay | Reclaimed 2 → 1 unprompted |
+
+CloudHub's EDGE ingress passes custom headers through untouched, so a caller that can set a header
+will have it arrive. An unauthorized request is never captured, so the store cannot be filled
+through `/autoscale/webhook`.
+
+### Documentation
+
+- README rewritten around the finding: a new **Where alerts come from** section carrying the
+  evidence, the setup section replaced with emitter instructions, the endpoint contract restated as
+  this project's own with a canonical body, and the opening corrected — it previously described the
+  trigger as an Anypoint Monitoring alert.
+- **Log retrieval is subscription-gated**, which bites in exactly the tier this project targets.
+  Tools routing through the Monitoring log-search API — including the MuleSoft MCP server's — fail
+  with `Required monitoringCenter subscription ... Current value: 3`. The CloudHub 2.0 deployment
+  log API is not gated and the CLI reaches it. Prefer `download-logs` over `logs`: the latter tails
+  and then crashes on an upstream bug in `anypoint-cli-ch1-plugin`
+  (`Cannot read properties of undefined (reading 'timestamp')`).
+- Known limitations now lead with the fact that Anypoint cannot drive this app.
+
+### Security
+
+- The webhook shared secret was rotated during this release's deployment.
+
+---
+
 ## 1.2.0 — Deployed and validated end to end on CloudHub 2.0
 
 The application has now actually been run. Until this release everything was verified either by

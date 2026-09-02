@@ -1,0 +1,219 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Reference alert emitter for mulesoft-autoscaler.
+
+  WHY THIS EXISTS
+  ===============
+  This autoscaler was originally designed to be driven by Anypoint Monitoring
+  alerts with webhook actions. That capability does not exist. Anypoint has three
+  alerting systems - Monitoring custom-dashboard alerts, Runtime Manager alerts,
+  and API Manager alerts - and all three deliver by email only, at every
+  subscription tier including Titanium. There is no HTTP destination anywhere.
+
+  So nothing MuleSoft ships is going to POST to /autoscale/webhook. Something you
+  control has to. That is what this file is: a drop-in flow for the application
+  you want scaled, which measures itself and reports to the autoscaler.
+
+  Because the caller is now yours rather than MuleSoft's, the request shape is
+  defined by this project rather than reverse-engineered from a vendor. See the
+  "Inbound contract" section of README.md.
+
+  HOW TO USE
+  ==========
+  1. Copy this file into the MONITORED application's src/main/mule/ directory -
+     not into the autoscaler itself. It measures the app it runs inside.
+  2. Add one line to each flow whose traffic should count towards scaling:
+
+         <flow-ref name="autoscaler-count-request"/>
+
+     Put it at the start of the flow, after the listener.
+  3. Add the properties listed below to that application's configuration.
+  4. Redeploy the monitored application.
+
+  The autoscaler needs no change to accept this: the body below already matches
+  the shape normalize-alert reads.
+
+  SAFETY
+  ======
+  The error handler at the bottom swallows everything. This flow runs inside your
+  application, and a monitoring sidecar that can take down the thing it monitors
+  is worse than no monitoring at all. If the autoscaler is unreachable, the wrong
+  secret is configured, or the endpoint 500s, this logs a warning and the host
+  application carries on undisturbed.
+
+  WHY REQUEST RATE, AND NOT CPU OR HEAP
+  =====================================
+  Because a Mule application cannot portably observe its own machine metrics, and
+  pretending otherwise produces a fragile example. Both obvious routes were tried
+  and both failed on a current runtime:
+
+    - java.lang.Runtime via DataWeave's java! interop returns null. DataWeave's
+      dot notation on a Java object performs JavaBean getter access, not
+      arbitrary method invocation, so totalMemory() resolves as a missing key
+      rather than a call.
+
+    - ManagementFactory::getMemoryMXBean().heapMemoryUsage resolves the getter
+      correctly but then dies on the Java 17 module system:
+      "class org.mule.weave.v2.module.pojo.reader.PropertyDefinition cannot
+      access class sun.management.MemoryImpl because module java.management does
+      not export sun.management". DataWeave reflects on the implementation class,
+      which is encapsulated.
+
+  CPU is no better: getSystemLoadAverage() reports the host rather than the
+  container, so on CloudHub 2.0 it reflects noisy neighbours instead of this
+  replica, and getProcessCpuLoad() requires a non-portable com.sun.management
+  cast.
+
+  Request rate needs no reflection, no added dependency, and no JVM flags, so it
+  survives runtime and Java upgrades. It is also the more useful signal: scaling
+  on an application-level measure is the one thing this autoscaler can do that
+  native CloudHub autoscaling cannot.
+
+  Substituting your own signal means editing one transform below - the autoscaler
+  acts on currentValue and ignores what produced it. Queue depth, in-flight
+  count, or orders-per-minute all work the same way.
+
+  ACCURACY
+  ========
+  The counter is a non-atomic read-modify-write, so under concurrency it
+  undercounts slightly. That is deliberate: a scaling signal needs to be roughly
+  right and cheap, and locking a shared store on every inbound request would cost
+  more than the imprecision does. Do not reuse this counter for billing.
+
+  REQUIRED PROPERTIES
+  ===================
+    autoscaler.host                  host of the deployed autoscaler, no scheme
+                                     e.g. mulesoft-autoscaler-abc123.region.cloudhub.io
+    autoscaler.secret                must equal the autoscaler's webhook.secret
+    autoscaler.emit.interval.seconds measurement window. 60 is reasonable; keep
+                                     it well below the autoscaler's cooldown
+    autoscaler.up.threshold          requests/minute at or above which to report
+    autoscaler.down.threshold        requests/minute at or below which to report
+    autoscaler.deployment.id         THIS app's CloudHub 2.0 deployment id
+    autoscaler.application.name      label used in the autoscaler's logs
+    autoscaler.organization.id       Anypoint organization id
+    autoscaler.environment.id        Anypoint environment id
+
+  A CloudHub 2.0 application has no way to discover its own deployment id at
+  runtime, so autoscaler.deployment.id must be supplied. Find it by running
+  "anypoint-cli-v4 runtime-mgr application list" against your org and
+  environment; README.md carries the full command with its flags.
+
+  Verified against Mule 4.11.6 and 4.12.2.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <http:request-config name="Autoscaler_Request_config" doc:name="Autoscaler endpoint">
+        <http:request-connection protocol="HTTPS" host="${autoscaler.host}" port="443"/>
+    </http:request-config>
+
+    <!-- In-memory on purpose: this holds a count for the current window only.
+         Losing it on restart costs one window of signal, and a restarted app has
+         no traffic history worth preserving anyway. -->
+    <os:object-store name="Autoscaler_Metrics"
+                     doc:name="Request counter"
+                     persistent="false"
+                     maxEntries="10"/>
+
+    <!--
+      Call this from each flow whose traffic should count towards scaling:
+          <flow-ref name="autoscaler-count-request"/>
+    -->
+    <sub-flow name="autoscaler-count-request">
+        <os:retrieve key="requests" objectStore="Autoscaler_Metrics" target="requestCount" doc:name="Read counter">
+            <os:default-value>#[0]</os:default-value>
+        </os:retrieve>
+        <os:store key="requests" objectStore="Autoscaler_Metrics" doc:name="Increment counter">
+            <os:value>#[(vars.requestCount default 0) + 1]</os:value>
+        </os:store>
+    </sub-flow>
+
+    <flow name="autoscaler-metrics-emitter">
+        <scheduler doc:name="Close the measurement window">
+            <scheduling-strategy>
+                <fixed-frequency frequency="${autoscaler.emit.interval.seconds}"
+                                 startDelay="${autoscaler.emit.interval.seconds}"
+                                 timeUnit="SECONDS"/>
+            </scheduling-strategy>
+        </scheduler>
+
+        <os:retrieve key="requests" objectStore="Autoscaler_Metrics" target="windowCount" doc:name="Read window count">
+            <os:default-value>#[0]</os:default-value>
+        </os:retrieve>
+
+        <!-- Reset immediately so the next window starts clean even if the report
+             below fails. A dropped report should cost one window, not corrupt
+             every window after it. -->
+        <os:store key="requests" objectStore="Autoscaler_Metrics" doc:name="Reset counter">
+            <os:value>#[0]</os:value>
+        </os:store>
+
+        <ee:transform doc:name="Compute requests per minute">
+            <ee:variables>
+                <ee:set-variable variableName="ratePerMinute"><![CDATA[%dw 2.0
+output application/java
+var count   = (vars.windowCount default 0) as Number
+var seconds = p('autoscaler.emit.interval.seconds') as Number
+---
+if (seconds <= 0) 0 else (count * 60) / seconds
+]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <!-- Report only when the value is actionable. The autoscaler would ignore
+             an in-band value anyway, so sending it is a round trip that can only
+             fail; staying quiet is strictly better. -->
+        <choice doc:name="Worth reporting?">
+            <when expression="#[vars.ratePerMinute >= (p('autoscaler.up.threshold') as Number) or vars.ratePerMinute &lt;= (p('autoscaler.down.threshold') as Number)]">
+                <http:request method="POST"
+                              config-ref="Autoscaler_Request_config"
+                              path="/autoscale/webhook"
+                              doc:name="Report to autoscaler">
+                    <http:body><![CDATA[#[output application/json
+---
+{
+    alert: {
+        id: "emitter-" ++ (now() as String {format: "yyyyMMddHHmmss"}),
+        metric: "requests-per-minute",
+        currentValue: vars.ratePerMinute,
+        resource: {
+            id: p('autoscaler.deployment.id'),
+            name: p('autoscaler.application.name'),
+            environment: { id: p('autoscaler.environment.id') }
+        },
+        organization: { id: p('autoscaler.organization.id') }
+    }
+}]]]></http:body>
+                    <http:headers><![CDATA[#[output application/java
+---
+{
+    "X-Autoscaler-Secret": p('autoscaler.secret'),
+    "Content-Type": "application/json"
+}
+]]]></http:headers>
+                </http:request>
+
+                <logger level="INFO" doc:name="Log report"
+                        message="#['Reported ' ++ (vars.ratePerMinute as String) ++ ' req/min to the autoscaler; it answered ' ++ (payload.status default 'no status')]"/>
+            </when>
+        </choice>
+
+        <error-handler>
+            <!-- Never let monitoring break the thing it monitors. -->
+            <on-error-continue type="ANY" logException="false" doc:name="Emitter failure is not the app's problem">
+                <logger level="WARN" doc:name="Log emitter failure"
+                        message="#['Could not report metrics to the autoscaler: ' ++ (error.description default 'unknown error') ++ '. The application is unaffected.']"/>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+</mule>

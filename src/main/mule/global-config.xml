@@ -47,4 +47,21 @@
                      doc:name="Managed deployments store"
                      persistent="true"
                      maxEntries="1000"/>
+
+    <!-- Diagnostic capture of raw inbound requests, used to verify what an alert
+         source actually posts. Written only when capture.enabled is true.
+
+         Persistent because the point is to survive the gap between an alert
+         firing and someone reading the result, which may span a restart. Small
+         and TTL'd: this holds unvalidated request bodies from an endpoint that
+         is deliberately unauthenticated, so it is bounded in both size and age
+         rather than left to grow. -->
+    <os:object-store name="Alert_Captures"
+                     doc:name="Alert captures store"
+                     persistent="true"
+                     maxEntries="25"
+                     entryTtl="604800"
+                     entryTtlUnit="SECONDS"
+                     expirationInterval="3600"
+                     expirationIntervalUnit="SECONDS"/>
 </mule>

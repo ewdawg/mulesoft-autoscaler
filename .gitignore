@@ -12,4 +12,5 @@ target/
 .idea/
 .vscode/
 .mule/
+.tooling-project/
 .DS_Store
