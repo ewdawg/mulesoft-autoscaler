@@ -1,5 +1,61 @@
 # Changelog
 
+## 1.2.0 — Deployed and validated end to end on CloudHub 2.0
+
+The application has now actually been run. Until this release everything was verified either by
+unit tests with mocked HTTP, or by calling the platform API directly — the app itself had never
+been deployed, its listener had never served a request, and its scheduler had never fired.
+
+### Validated on a live deployment
+
+Deployed to a CloudHub 2.0 sandbox and driven by POSTing alerts at its public URL:
+
+| Behaviour | Result |
+|---|---|
+| No / wrong `X-Autoscaler-Secret` | 401 `unauthorized` |
+| CPU 92 with valid secret | 200 `scaled`, target application went **1 → 2 replicas** |
+| Immediate repeat alert | `skipped` — cooldown suppressed it |
+| CPU 55, between thresholds | `skipped`, `direction: NONE`, no platform API calls made |
+| Alert with no deployment id | 400 `bad_request` |
+| Left idle past `decay.idle.seconds` | **decay fired unprompted, target reclaimed 2 → 1** |
+
+The decay result resolves the largest open risk in 1.1.0. That release made both object stores
+persistent, which on CloudHub 2.0 means **Object Store v2** — a network-backed service whose
+support for `os:retrieve-all-keys` was unverified. The whole decay sweep depends on that call, so
+had it been unsupported, decay would have silently done nothing: precisely the failure it was added
+to prevent. It works.
+
+### Changed
+
+- `mule-artifact.json` now declares `minMuleVersion: 4.9.0` (was 4.11.0), so the app can deploy on
+  an **LTS** channel runtime. EDGE-channel deploys were rejected by this org, and the one existing
+  EDGE application in it is not running, so LTS is the safer default.
+
+### Documentation
+
+- README now carries the deployment procedure that actually works, and says plainly which
+  documented approach does *not*: the `mule-maven-plugin` `cloudhub2Deployment` block does not
+  publish the artifact to Exchange, so the deploy fails with "Failed to retrieve artifact
+  information from Exchange". Publishing separately with `deploy:deploy-file` also failed. The
+  working path is `anypoint-cli-v4 exchange asset upload` followed by
+  `runtime-mgr application deploy`, with two non-obvious details recorded: the Exchange file key
+  must be exactly `mule-application.jar`, and positional arguments must precede the variadic
+  `--property` flags or they are swallowed.
+- No `cloudhub2Deployment` block is committed, since it does not work; carrying broken
+  configuration would be worse than none.
+
+### Known gap
+
+Tests run on Mule 4.11.6 while the app deploys on 4.9.20, because MUnit 3.7 cannot create an
+embedded container for 4.9.20. The app uses no feature newer than 4.9, but the runtimes differ.
+
+### Still open
+
+The **inbound webhook contract**. Every alert used above was synthetic, hand-built to match the
+assumed shape. No real Anypoint Monitoring alert has been captured.
+
+---
+
 ## 1.1.1 — Platform API contract verified against a live environment
 
 Everything this app sends to Anypoint has now been exercised against a real CloudHub 2.0 sandbox

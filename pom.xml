@@ -6,7 +6,7 @@
 
     <groupId>com.ewdawg</groupId>
     <artifactId>mulesoft-autoscaler</artifactId>
-    <version>1.1.1</version>
+    <version>1.2.0</version>
     <packaging>mule-application</packaging>
 
     <name>mulesoft-autoscaler</name>
@@ -50,6 +50,19 @@
                     <argLines>
                         <argLine>-XX:+IgnoreUnrecognizedVMOptions</argLine>
                     </argLines>
+                    <!--
+                      Pin the test runtime. Without this, MUnit derives its embedded
+                      container version from mule-artifact.json's minMuleVersion, which is
+                      deliberately 4.9.0 so the app can deploy on an LTS runtime. The tests
+                      still run on ${app.runtime}; the app uses no feature newer than 4.9.
+                    -->
+                    <runtimeConfiguration>
+                        <discoverRuntimes>
+                            <minMuleVersion>${app.runtime}</minMuleVersion>
+                            <product>EE</product>
+                            <includeSnapshots>false</includeSnapshots>
+                        </discoverRuntimes>
+                    </runtimeConfiguration>
                 </configuration>
             </plugin>
         </plugins>

@@ -227,25 +227,44 @@ sub-flow.
 
 ## Verified against a live environment
 
-The platform-API side of this app has been exercised against a real CloudHub 2.0 sandbox, not just
-against mocks:
+This app has been **deployed to CloudHub 2.0 and exercised end to end** against a real sandbox — not
+only unit-tested against mocks.
 
-| Assumption | How it was checked | Result |
-|---|---|---|
-| `GET /amc/application-manager/api/v2/organizations/{org}/environments/{env}/deployments/{id}` | Direct call with a Connected App token | **200 OK** |
-| Replica count lives at `target.replicas` | Read from a real deployment | **Confirmed** |
-| `PATCH` accepts a partial `{"target":{"replicas":n}}` | Scaled a running app 1 → 2, then back | **200, and the second replica actually started** |
-| Token endpoint + `client_credentials` form body | Same request `anypoint-get-token` makes | **Works** |
-| Replica count is independent of vCore sizing | `application.vCores` unchanged across the scaling | **Confirmed** |
+**Platform API contract:**
 
-What this does *not* cover is the inbound webhook body — see
-[Known limitations](#known-limitations). Everything the app sends to Anypoint is verified;
-what Anypoint sends the app is not.
+| Assumption | Result |
+|---|---|
+| `GET /amc/application-manager/api/v2/organizations/{org}/environments/{env}/deployments/{id}` | **200 OK** |
+| Replica count lives at `target.replicas` | **Confirmed** |
+| `PATCH` accepts a partial `{"target":{"replicas":n}}` | **Accepted, and the new replica actually started** |
+| Token endpoint + `client_credentials` form body | **Works** |
+| Replica count independent of vCore sizing | **Confirmed** — `application.vCores` unchanged |
+
+**Running behaviour**, tested by POSTing alerts at the deployed app's public URL and watching a real
+target application:
+
+| Behaviour | Result |
+|---|---|
+| No `X-Autoscaler-Secret` | **401**, `unauthorized` |
+| Wrong secret | **401**, `unauthorized` |
+| CPU 92 with valid secret | **200**, `scaled` — target went **1 → 2 replicas** |
+| Immediate repeat alert | **`skipped`** — cooldown suppressed it |
+| CPU 55 (between thresholds) | **`skipped`**, `direction: NONE`, no platform API calls |
+| Alert with no deployment id | **400**, `bad_request` |
+| Left idle past `decay.idle.seconds` | **Decay fired unprompted — target reclaimed 2 → 1** |
+
+That last row is the important one. It confirms the scheduler runs, and that
+`os:retrieve-all-keys` works against **Object Store v2** on CloudHub 2.0 — the assumption the whole
+decay design rests on, and the one that could not be checked without deploying.
+
+What remains untested is the **inbound webhook body**: the alerts above were synthetic, hand-built
+to match the assumed shape. Everything the app sends to Anypoint is verified; what Anypoint sends
+the app is not. See [Known limitations](#known-limitations).
 
 ## Build and test
 
 ```bash
-mvn clean package     # target/mulesoft-autoscaler-1.1.1-mule-application.jar
+mvn clean package     # target/mulesoft-autoscaler-1.2.0-mule-application.jar
 mvn test              # MUnit suite (20 tests)
 ```
 
@@ -258,9 +277,73 @@ First run needs network: the Mule runtime and connectors resolve from `repositor
 
 ## Deploying
 
-Deploy the packaged artifact to CloudHub 2.0 via Runtime Manager, or add a `cloudhub2Deployment`
-block to `pom.xml` and run `mvn deploy -DmuleDeploy`. Supply secrets as system properties at deploy
-time rather than baking them into the artifact.
+CloudHub 2.0 deploys **from Exchange**, not from a local file, so this is a two-step process. The
+commands below are the ones actually used to deploy and validate this app.
+
+**A note on what does not work:** the `mule-maven-plugin` `cloudhub2Deployment` block is the
+commonly documented route, but in practice it failed here — it does not publish the artifact to
+Exchange first, so the deployment fails with *"Failed to retrieve artifact information from
+Exchange."* Publishing separately via `deploy:deploy-file` also failed (connection reset). The
+Anypoint CLI path below is what worked, so that is what is documented.
+
+**1. Package and publish to Exchange.** The Exchange asset id must be the **organization ID** as
+the group, and the file key must be exactly `mule-application.jar`:
+
+```bash
+mvn clean package
+
+anypoint-cli-v4 exchange asset upload \
+  --organization "$ORG_ID" \
+  --name "mulesoft-autoscaler" \
+  --type app \
+  --files '{"mule-application.jar":"/abs/path/target/mulesoft-autoscaler-1.2.0-mule-application.jar"}' \
+  "$ORG_ID/mulesoft-autoscaler/1.2.0"
+```
+
+**2. Deploy from Exchange.** Positional arguments must come **before** the flags — the variadic
+`--property` flags will otherwise swallow them:
+
+```bash
+anypoint-cli-v4 runtime-mgr application deploy \
+  'mulesoft-autoscaler' 'cloudhub-us-west-2' '4.9.20' 'mulesoft-autoscaler' \
+  --organization "$ORG_ID" --environment 'Sandbox' \
+  --groupId "$ORG_ID" --assetVersion '1.2.0' \
+  --replicas 1 --replicaSize 0.1 \
+  --releaseChannel LTS --javaVersion 17 \
+  --property "http.port:8081" \
+  --property "anypoint.host:anypoint.mulesoft.com" \
+  --property "scale.up.threshold:80" \
+  --property "scale.down.threshold:30" \
+  --property "scale.min.replicas:1" \
+  --property "scale.max.replicas:3" \
+  --property "scale.cooldown.seconds:600" \
+  --property "decay.enabled:true" \
+  --property "decay.interval.seconds:300" \
+  --property "decay.idle.seconds:1800" \
+  --property "anypoint.client.id:$CLIENT_ID" \
+  --secureProperty "anypoint.client.secret:$CLIENT_SECRET" \
+  --secureProperty "webhook.secret:$WEBHOOK_SECRET"
+```
+
+Secrets go in as `--secureProperty`, so they are masked in Runtime Manager and excluded from logs.
+
+### Runtime version
+
+Deploy on an **LTS** channel runtime (`4.9.20` at time of writing) rather than EDGE. `mule-artifact.json`
+declares `minMuleVersion: 4.9.0` to allow this. Note the tests run on 4.11.6, because MUnit 3.7
+cannot create an embedded container for 4.9.20 — a mismatch worth knowing about, though the app uses
+no feature newer than 4.9.
+
+To find valid targets and their supported runtimes:
+
+```bash
+curl -s "https://anypoint.mulesoft.com/runtimefabric/api/organizations/$ORG_ID/targets" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+The deploy target argument is the target **`id`** (e.g. `cloudhub-us-west-2`).
+
+### Replica count
 
 Both object stores are persistent, so on CloudHub 2.0 they use Object Store v2 and survive restarts.
 Run this app as a **single replica** — see [Known limitations](#known-limitations).
