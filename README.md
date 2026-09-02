@@ -225,10 +225,27 @@ Before production, point one alert at a request-capture endpoint (or temporarily
 payload in `normalize-alert`) and confirm the mappings above. All mapping lives in that one
 sub-flow.
 
+## Verified against a live environment
+
+The platform-API side of this app has been exercised against a real CloudHub 2.0 sandbox, not just
+against mocks:
+
+| Assumption | How it was checked | Result |
+|---|---|---|
+| `GET /amc/application-manager/api/v2/organizations/{org}/environments/{env}/deployments/{id}` | Direct call with a Connected App token | **200 OK** |
+| Replica count lives at `target.replicas` | Read from a real deployment | **Confirmed** |
+| `PATCH` accepts a partial `{"target":{"replicas":n}}` | Scaled a running app 1 → 2, then back | **200, and the second replica actually started** |
+| Token endpoint + `client_credentials` form body | Same request `anypoint-get-token` makes | **Works** |
+| Replica count is independent of vCore sizing | `application.vCores` unchanged across the scaling | **Confirmed** |
+
+What this does *not* cover is the inbound webhook body — see
+[Known limitations](#known-limitations). Everything the app sends to Anypoint is verified;
+what Anypoint sends the app is not.
+
 ## Build and test
 
 ```bash
-mvn clean package     # target/mulesoft-autoscaler-1.1.0-mule-application.jar
+mvn clean package     # target/mulesoft-autoscaler-1.1.1-mule-application.jar
 mvn test              # MUnit suite (20 tests)
 ```
 
@@ -298,9 +315,6 @@ entries live until the deployment is back at minimum).
 - **The inbound webhook contract is unverified.** The exact body Anypoint Monitoring posts has not
   been confirmed against a live alert. `normalize-alert` tolerates the shapes this project has
   previously assumed and is the single place to correct.
-- **The Application Manager API shape is unverified.** The `PATCH` assumes a partial
-  `{"target":{"replicas":n}}` is accepted, and the `GET` assumes replicas live at `target.replicas`.
-  Confirm both against a sandbox before production.
 - **Only deployments this app has scaled are tracked for decay.** A deployment already sitting at an
   elevated count when this app is first deployed will not be reclaimed until an alert scales it once.
 - **Run a single replica.** Two replicas of *this* app would sweep concurrently and could double-step

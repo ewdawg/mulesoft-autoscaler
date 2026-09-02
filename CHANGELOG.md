@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.1.1 — Platform API contract verified against a live environment
+
+Everything this app sends to Anypoint has now been exercised against a real CloudHub 2.0 sandbox
+rather than against mocks alone. Three assumptions carried since 1.0.0 are resolved.
+
+### Verified
+
+- `GET /amc/application-manager/api/v2/organizations/{org}/environments/{env}/deployments/{id}`
+  returns **200**. The URL `anypoint-get-deployment` builds is correct.
+- Replica count lives at **`target.replicas`**, as `apply-scaling` assumes.
+- A **partial** `PATCH` body of `{"target":{"replicas":n}}` is accepted and takes effect: a running
+  application was scaled 1 → 2, the second replica started, and it was then restored to 1. This was
+  the last open question about the write path.
+- The token endpoint and `client_credentials` form body used by `anypoint-get-token` work as written.
+- `application.vCores` is independent of `target.replicas`, confirming that a replica change cannot
+  resize an application.
+
+### Corrected
+
+The 1.0.0 entry claimed the original code's `payload.replicas` was absent, so its `default 1` always
+applied and the app scaled to exactly 2. **That was wrong**, and the live response shows why:
+`payload.replicas` *does* exist at the top level, but it holds an **array of live replica
+instances**, not a count:
+
+```json
+"replicas": [{"id":"...-55d54f8bd7-h5gzw","state":"STARTED", ...}]
+```
+
+`default` therefore never fired. `(current as Number) + 1` would have attempted to coerce a `List`
+to a `Number` and thrown at runtime. The original would not have mis-scaled — it would have failed
+outright on its first real alert.
+
+The same response also vindicates sending a minimal `PATCH`: `target.deploymentSettings` carries a
+large nested structure (sidecars, HTTP endpoints, JVM args, runtime channel). Reconstructing a full
+body, as the superseded `autoscaler_updated.xml` did, would have had to reproduce all of it
+faithfully or silently drop parts of it.
+
+### Still open
+
+The **inbound webhook contract** remains unverified — no live Anypoint Monitoring alert has been
+captured. Everything the app *sends* is now confirmed; what Anypoint *sends the app* is not.
+
+---
+
 ## 1.1.0 — Decay safety net and durable state
 
 Context: this project emulates CloudHub 2.0 autoscaling, which is gated behind the **Titanium**
@@ -99,8 +143,8 @@ real Mule 4 application against the same intent.
 
 ### Fixed
 
-- Replica count is read from `target.replicas`. The original read `payload.replicas`, so its
-  `default 1` always applied and the app scaled to exactly 2 regardless of actual size.
+- Replica count is read from `target.replicas`. The original read `payload.replicas`.
+  (See the 1.1.1 note below — the effect of that bug was worse than described here.)
 - `min` / `max` are called with an array (`min([a, b])`). The previous two-argument form was not
   valid DataWeave.
 - The OAuth request body is a DataWeave expression. It was previously literal text with embedded
